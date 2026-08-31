@@ -418,7 +418,12 @@ def extract_losses(
         lengths.append(l.size(-1))
     max_length = torch.tensor([max(lengths)]).to(device)
     #We need to sync the max lengths otherwise we can't gather the losses afterwards
-    dist.all_reduce(max_length, op=dist.ReduceOp.MAX)
+    if (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    ):
+        dist.all_reduce(max_length, op=dist.ReduceOp.MAX)
     
     all_losses = torch.concat(pad_tensors(all_losses,max_length.item()))
     all_tasks = torch.concat(all_tasks).flatten()
@@ -508,10 +513,12 @@ def _load_trained_predictor(predictor, checkpoint_path):
     checkpoint = torch.load(
         checkpoint_path, map_location="cpu", weights_only=False
     )
-    if checkpoint.get("mode") not in {"end_to_end_jepa", "electronic_control"}:
+    if checkpoint.get("mode") not in {
+        "end_to_end_jepa", "electronic_control", "onn_feedback"
+    }:
         raise ValueError(
-            "trained Predictor checkpoint must have mode=end_to_end_jepa "
-            "or mode=electronic_control"
+            "trained Predictor checkpoint must have mode=end_to_end_jepa, "
+            "electronic_control, or onn_feedback"
         )
     state_dict = checkpoint.get("predictor")
     if state_dict is None:

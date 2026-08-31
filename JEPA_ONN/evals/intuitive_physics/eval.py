@@ -177,6 +177,32 @@ def _gpu_peak_memory_mib(device):
     return f"{torch.cuda.max_memory_allocated(device) / (1024 ** 2):.0f}MiB"
 
 
+def _prepare_intphys_batch(clips, labels):
+    if clips.ndim < 2 or clips.shape[1] != 4:
+        raise ValueError(
+            "IntPhys Dev batches must have shape [groups, 4, ...]"
+        )
+    if labels.ndim != 2 or tuple(labels.shape) != tuple(clips.shape[:2]):
+        raise ValueError(
+            "IntPhys Dev labels must have shape [groups, 4]"
+        )
+
+    pair_matches = []
+    for group_index, group_clip in enumerate(clips):
+        group_offset = group_index * 4
+        for match in get_matches(get_breaking_points(group_clip)):
+            pair_matches.append(
+                [group_offset + video_index for video_index in match]
+            )
+
+    return (
+        clips.flatten(0, 1),
+        labels.reshape(-1),
+        pair_matches,
+        labels,
+    )
+
+
 def main(args_eval, resume_preempt=False):
 
     # ----------------------------------------------------------------------- #
@@ -582,7 +608,10 @@ def compute_metrics(losses,labels):
     data1= loss_real.max(1)[0]
     data2 = loss_fake.max(1)[0]
     #Get 90% loss
-    thresh = data1.sort()[0][int(np.ceil(0.90*len(data1)))]
+    threshold_index = min(
+        int(np.ceil(0.90 * len(data1))), len(data1) - 1
+    )
+    thresh = data1.sort()[0][threshold_index]
     #logger.info(f"Threshold: {thresh}")
     accuracy_abs = ((data1 < thresh).sum() + (data2 > thresh).sum())/ (data1.shape[0] + data2.shape[0]) * 100
 
@@ -704,18 +733,24 @@ def extract_losses(
     for i in range(total_batches):
         udata_labels = next(loader)
 
-        labels = udata_labels[1][0]
-
+        labels = udata_labels[1]
         clip = udata_labels[0]
-        clip = clip[0].to(device)
+
+        if dataset == "intphys":
+            clip, labels, matches, group_labels = _prepare_intphys_batch(
+                clip, labels
+            )
+            num_groups = group_labels.shape[0]
+        else:
+            labels = labels[0]
+            clip = clip[0]
+
+        clip = clip.to(device)
 
         #if we have quadruplets or pairs
         num_videos = clip.shape[0]
 
-        if dataset == "intphys":
-            bps = get_breaking_points(clip)
-            matches = get_matches(bps)
-        elif "grasp" in dataset:
+        if "grasp" in dataset:
             matches = [[0,1]]
         elif "inflevel" in dataset :
             matches = [[0,1]]
@@ -798,8 +833,11 @@ def extract_losses(
         losses = losses.permute(1,0,2)
 
         if dataset == "intphys":
-            official_group_losses.append(losses)
-            official_group_labels.append(labels)
+            grouped_losses = losses.reshape(
+                num_groups, 4, *losses.shape[1:]
+            )
+            official_group_losses.extend(grouped_losses.unbind(0))
+            official_group_labels.extend(group_labels.unbind(0))
 
         # Always append by matches for easy filtering later
         # i.e. all_losses[all_labels == 0] and 1 are matched pairwise
@@ -833,7 +871,12 @@ def extract_losses(
         lengths.append(l.size(-1))
     max_length = torch.tensor([max(lengths)]).to(device)
     #We need to sync the max lengths otherwise we can't gather the losses afterwards
-    dist.all_reduce(max_length, op=dist.ReduceOp.MAX)
+    if (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    ):
+        dist.all_reduce(max_length, op=dist.ReduceOp.MAX)
 
     all_losses = torch.concat(pad_tensors(all_losses,max_length.item()))
     all_labels = torch.concat(all_labels)

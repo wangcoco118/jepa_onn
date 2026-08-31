@@ -698,7 +698,9 @@ class ONNFeedbackPredictor(nn.Module):
             masks_ctxt.unsqueeze(-1).expand(-1, -1, self.predictor_embed_dim),
             context_384,
         )
-        target_placeholder = self.mask_token.expand(
+        target_placeholder = self.mask_token.to(
+            device=ctxt.device, dtype=dense_input.dtype
+        ).expand(
             batch_size, masks_tgt.shape[1], self.predictor_embed_dim
         )
         dense_input.scatter_(

@@ -319,12 +319,17 @@ class FeedbackFSONN(nn.Module):
     def _encode(self, slot: torch.Tensor) -> torch.Tensor:
         scale = self._positive_parameter(self.input_scale_raw)
         normalized = torch.clamp(slot / scale, min=-1.0, max=1.0)
-        phase = torch.where(
-            normalized >= 0,
-            torch.zeros_like(normalized),
-            torch.full_like(normalized, torch.pi),
+        polar_input = (
+            normalized.float()
+            if normalized.dtype == torch.bfloat16
+            else normalized
         )
-        encoded = torch.polar(normalized.abs(), phase)
+        phase = torch.where(
+            polar_input >= 0,
+            torch.zeros_like(polar_input),
+            torch.full_like(polar_input, torch.pi),
+        )
+        encoded = torch.polar(polar_input.abs(), phase)
         if self.config.grid_width > self.config.input_dim:
             zeros = torch.zeros(
                 slot.shape[0],

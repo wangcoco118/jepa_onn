@@ -162,6 +162,21 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
         self.assertEqual(predictor.last_trace["covered_count"], 1008)
         self.assertEqual(predictor.last_trace["missing_count"], 560)
 
+    def test_mask_token_scatter_matches_autocast_canvas_dtype(self):
+        predictor = self.make_predictor()
+        class ToBFloat(nn.Module):
+            def forward(self, value):
+                return value.to(torch.bfloat16)
+
+        predictor.predictor_embed = ToBFloat()
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = full_masks()
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            output = predictor(context, None, masks_ctxt, masks_tgt)
+
+        self.assertEqual(tuple(output.shape), (1, 1560, 1024))
+
     def test_mask_token_mode_does_not_read_real_target(self):
         predictor = self.make_predictor()
         context = torch.randn(1, 8, 1024)
@@ -505,6 +520,23 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
         self.assertFalse(
             any(any(token in name for token in forbidden) for name, _ in model.named_parameters())
         )
+
+    def test_feedback_onn_encodes_bfloat16_input_as_complex64(self):
+        model = FeedbackFSONN(small_onn_config())
+        slot = torch.tensor(
+            [[[0.25, -0.5], [0.75, -1.0]]],
+            dtype=torch.bfloat16,
+        )
+
+        encoded = model._encode(slot)
+
+        self.assertEqual(encoded.dtype, torch.complex64)
+        self.assertTrue(torch.isfinite(encoded).all())
+
+        output = model(slot)
+
+        self.assertEqual(output.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(output).all())
 
     def test_dynamic_feedback_phase_is_bounded_zero_centered_and_differentiable(self):
         config = small_onn_config()

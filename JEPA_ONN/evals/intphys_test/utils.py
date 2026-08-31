@@ -133,6 +133,12 @@ def get_action_timestep(matched_clips):
 
 
 def batch_all_gather(x):
+    if not (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    ):
+        return x
     x_list = FullGatherLayer.apply(x)
     return torch.cat(x_list, dim=0)
 

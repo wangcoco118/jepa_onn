@@ -21,7 +21,7 @@ pretrain:
   frames_per_clip: 16
 
 data:
-  batch_size: 20
+  batch_size: 25
   resolution: 224
   stride_sliding_window: 2
   use_bfloat16: true
@@ -39,7 +39,7 @@ data_split:
 training:
   mode: end_to_end_jepa
   experiment_mode: onn_feedback
-  epochs: 50
+  epochs: 25
   split_manifest: /data/linux/wkx/IntPhys/references_code/references/splits/intphys_train_val.json
   last_output: null
   clip_grad: 10.0
@@ -61,9 +61,11 @@ onn:
   feedback_enabled: true
   feedback_memory_enabled: true
   feedback_memory_alpha: 0.8
-  feedback_layer_index: 1
+  feedback_layer_mode: multi
+  feedback_layer_indices: [2, 3, 4]
+  feedback_gain_mode: independent
   feedback_phase_max_rad: 1.5707963267948966
-  feedback_gain_init: 1.0
+  feedback_gain_init: [0.30, 0.33, 0.36]
   readout_mode: intensity_minus_learnable_offset
   learnable_intensity_offset: true
   use_differential_detector: false
