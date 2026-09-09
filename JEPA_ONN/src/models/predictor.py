@@ -10,6 +10,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.masks.utils import apply_masks
 from src.models.utils.modules import Block
@@ -404,6 +405,7 @@ class ONNFeedbackPredictor(nn.Module):
         num_chunks=8,
         chunk_tokens=196,
         output_mlp_hidden_dim=384,
+        output_mode="mlp",
         feedback_mode="fixed_middle_phase",
         feedback_layer_mode=None,
         feedback_layer_index=None,
@@ -431,6 +433,15 @@ class ONNFeedbackPredictor(nn.Module):
         self.num_chunks = int(num_chunks)
         self.chunk_tokens = int(chunk_tokens)
         self.feedback_mode = feedback_mode
+        if not isinstance(output_mode, str) or output_mode not in {
+            "mlp",
+            "linear",
+            "interpolate",
+        }:
+            raise ValueError(
+                "output_mode must be one of: 'mlp', 'linear', 'interpolate'"
+            )
+        self.output_mode = output_mode
 
         self.predictor_embed = nn.Linear(
             self.embed_dim, self.predictor_embed_dim, bias=True
@@ -453,11 +464,16 @@ class ONNFeedbackPredictor(nn.Module):
             uniform_power=uniform_power,
         )
         self.predictor_norm = nn.LayerNorm(self.predictor_embed_dim)
-        self.output_mlp = nn.Sequential(
-            nn.Linear(self.predictor_embed_dim, int(output_mlp_hidden_dim)),
-            nn.GELU(),
-            nn.Linear(int(output_mlp_hidden_dim), self.embed_dim),
-        )
+        if self.output_mode == "mlp":
+            self.output_mlp = nn.Sequential(
+                nn.Linear(self.predictor_embed_dim, int(output_mlp_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(output_mlp_hidden_dim), self.embed_dim),
+            )
+        elif self.output_mode == "linear":
+            self.output_linear = nn.Linear(
+                self.predictor_embed_dim, self.embed_dim
+            )
 
         if onn_core is None:
             config_values = dict(optical_config or {})
@@ -773,7 +789,22 @@ class ONNFeedbackPredictor(nn.Module):
             1,
             masks_tgt.unsqueeze(-1).expand(-1, -1, self.predictor_embed_dim),
         )
-        pred_tgt_1024 = self.output_mlp(pred_tgt_384)
+        if self.output_mode == "mlp":
+            pred_tgt_1024 = self.output_mlp(pred_tgt_384)
+        elif self.output_mode == "linear":
+            pred_tgt_1024 = self.output_linear(pred_tgt_384)
+        else:
+            batch_size, num_target_tokens, input_dim = pred_tgt_384.shape
+            pred_tgt_1024 = F.interpolate(
+                pred_tgt_384.reshape(
+                    batch_size * num_target_tokens, 1, input_dim
+                ),
+                size=self.embed_dim,
+                mode="linear",
+                align_corners=False,
+            ).reshape(
+                batch_size, num_target_tokens, self.embed_dim
+            )
         self.last_trace = {
             "ctxt_shape": tuple(ctxt.shape),
             "context_384_shape": tuple(context_384.shape),
@@ -782,6 +813,7 @@ class ONNFeedbackPredictor(nn.Module):
             "dense_output_shape": tuple(dense_output.shape),
             "pred_tgt_384_shape": tuple(pred_tgt_384.shape),
             "pred_tgt_1024_shape": tuple(pred_tgt_1024.shape),
+            "output_mode": self.output_mode,
             "n_ctxt": int(masks_ctxt.shape[1]),
             "n_tgt": int(masks_tgt.shape[1]),
             "covered_count": (

@@ -311,7 +311,9 @@ def _load_config(path):
         return yaml.safe_load(handle)
 
 
-def _apply_cli_overrides(config, batch_size=None, target_node=None, mask_mode=None):
+def _apply_cli_overrides(
+    config, batch_size=None, target_node=None, mask_mode=None, feedback_enabled=None
+):
     if batch_size is not None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -320,6 +322,13 @@ def _apply_cli_overrides(config, batch_size=None, target_node=None, mask_mode=No
         config.setdefault("distillation", {})["target_node"] = target_node
     if mask_mode is not None:
         config["mask_mode"] = normalize_mask_mode(mask_mode)
+    if feedback_enabled is not None:
+        onn_config = config.setdefault("onn", config.get("onn_feedback", {}))
+        onn_config["feedback_enabled"] = bool(feedback_enabled)
+        if not feedback_enabled:
+            # A disabled physical feedback path must not retain an unused
+            # memory state; this also satisfies ONNConfig's invariant.
+            onn_config["feedback_memory_enabled"] = False
     return config
 
 
@@ -1046,6 +1055,7 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
         is_mae=False,
         optical_qkv={} if predictor_type == "onn_feedback" else optical_cfg,
         predictor_type=predictor_type,
+        output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
         onn_feedback_config=onn_cfg,
     )
     if predictor_type != "onn_feedback" and experiment_mode == "optical_qkv":
@@ -2084,6 +2094,12 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
+        "--feedback-enabled",
+        choices=("true", "false"),
+        default=None,
+        help="enable physical ONN feedback, or set it false for the zero-feedback ablation",
+    )
+    parser.add_argument(
         "--mask-mode",
         choices=("unified_random", "classic_random"),
         default=None,
@@ -2112,6 +2128,9 @@ def main():
         batch_size=args.batch_size,
         target_node=args.target_node,
         mask_mode=args.mask_mode,
+        feedback_enabled=(
+            None if args.feedback_enabled is None else args.feedback_enabled == "true"
+        ),
     )
     outputs = _resolve_run_outputs(args.output)
     training_cfg = config.setdefault("training", {})

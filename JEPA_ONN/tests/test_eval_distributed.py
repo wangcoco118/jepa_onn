@@ -34,6 +34,37 @@ class EvalDistributedFallbackTests(unittest.TestCase):
             self.fail(f"small valid IntPhys metrics raised {exc!r}")
         self.assertIn("Classifier threhshold", metrics)
 
+    def test_last_context_copy_flag_defaults_off_and_accepts_boolean(self):
+        self.assertFalse(dev_eval._last_context_copy_enabled({}))
+        self.assertFalse(
+            dev_eval._last_context_copy_enabled(
+                {"evaluation": {"last_context_copy_baseline": False}}
+            )
+        )
+        self.assertTrue(
+            dev_eval._last_context_copy_enabled(
+                {"evaluation": {"last_context_copy_baseline": True}}
+            )
+        )
+        with self.assertRaisesRegex(TypeError, "must be a boolean"):
+            dev_eval._last_context_copy_enabled(
+                {"evaluation": {"last_context_copy_baseline": "true"}}
+            )
+
+    def test_last_context_copy_repeats_complete_last_spatial_slice(self):
+        context = torch.arange(18, dtype=torch.float32).reshape(1, 6, 3)
+
+        prediction = dev_eval._last_context_copy_prediction(
+            context,
+            num_target_tokens=4,
+            spatial_tokens=2,
+            normalize=False,
+        )
+
+        expected = context[:, -2:, :].repeat(1, 2, 1)
+        self.assertTrue(torch.equal(prediction, expected))
+        self.assertEqual(tuple(prediction.shape), (1, 4, 3))
+
     def test_batch_all_gather_returns_local_tensor_without_process_group(self):
         self.assertFalse(dist.is_initialized())
         tensor = torch.tensor([[1.0, 2.0]])

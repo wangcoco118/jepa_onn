@@ -72,6 +72,37 @@ torch.backends.cudnn.benchmark = True
 pp = pprint.PrettyPrinter(indent=4)
 
 
+def _last_context_copy_enabled(args_eval):
+    value = (args_eval.get("evaluation") or {}).get(
+        "last_context_copy_baseline", False
+    )
+    if not isinstance(value, bool):
+        raise TypeError("evaluation.last_context_copy_baseline must be a boolean")
+    return value
+
+
+def _last_context_copy_prediction(
+    context,
+    num_target_tokens,
+    spatial_tokens,
+    normalize=True,
+):
+    if context.ndim != 3:
+        raise ValueError("context must have shape [B,N,D]")
+    if spatial_tokens <= 0:
+        raise ValueError("spatial_tokens must be positive")
+    if context.shape[1] < spatial_tokens or context.shape[1] % spatial_tokens != 0:
+        raise ValueError("context must contain complete spatial token slices")
+    if num_target_tokens <= 0 or num_target_tokens % spatial_tokens != 0:
+        raise ValueError("target must contain complete spatial token slices")
+
+    last_context = context[:, -spatial_tokens:, :]
+    if normalize:
+        last_context = F.layer_norm(last_context, (last_context.size(-1),))
+    future_steps = num_target_tokens // spatial_tokens
+    return last_context.repeat(1, future_steps, 1)
+
+
 class SynchronizedProgressLog:
     def __init__(self, path, print_enabled=True):
         self.path = path
@@ -257,6 +288,7 @@ def main(args_eval, resume_preempt=False):
     is_mae = args_eval.get('is_mae', False)
     mae_decoder_blocks = args_eval.get('mae_decoder_blocks', -1)
     normalize_targets =args_eval.get('normalize_targets',True)
+    last_context_copy_baseline = _last_context_copy_enabled(args_eval)
     # ----------------------------------------------------------------------- #
 
     try:
@@ -286,6 +318,7 @@ def main(args_eval, resume_preempt=False):
         f"START rank={rank}/{world_size} device={device} dataset={dataset} "
         f"model={model_name} checkpoint={pretrained_path} batch_size={batch_size} "
         f"resolution={resolution} frames_per_clip={eval_frames_per_clip} "
+        f"prediction_mode={'last_context_copy' if last_context_copy_baseline else 'predictor'} "
         f"log_file={progress_log_file}"
     )
     # Initialize model
@@ -312,6 +345,7 @@ def main(args_eval, resume_preempt=False):
         optical_qkv=optical_qkv,
         predictor_checkpoint=predictor_checkpoint,
         predictor_type=args_eval.get("predictor_type", "onn_feedback"),
+        output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
         onn_feedback_config=args_eval.get(
             "onn", args_eval.get("onn_feedback", optical_qkv)
         ),
@@ -373,6 +407,7 @@ def main(args_eval, resume_preempt=False):
                     patch_size=patch_size,
                     resolution=resolution,
                     normalize_targets=normalize_targets,
+                    last_context_copy_baseline=last_context_copy_baseline,
                     progress_log=progress_log)
 
                 all_losses = batch_all_gather(all_losses).cpu()
@@ -672,6 +707,7 @@ def extract_losses(
     patch_size=16,
     resolution=224,
     normalize_targets=True,
+    last_context_copy_baseline=False,
     progress_log=None
 ):
     if progress_log is None:
@@ -823,7 +859,20 @@ def extract_losses(
                             z_ += [F.layer_norm(zi,(zi.size(-1),))]
                         context = z_
 
-                    preds = predictor(context, targets, masks_enc, masks_pred)
+                    if last_context_copy_baseline:
+                        if resolution % patch_size != 0:
+                            raise ValueError("resolution must be divisible by patch_size")
+                        spatial_tokens = (resolution // patch_size) ** 2
+                        preds = [
+                            _last_context_copy_prediction(
+                                context[0],
+                                num_target_tokens=masks_pred[0].shape[1],
+                                spatial_tokens=spatial_tokens,
+                                normalize=normalize_targets,
+                            )
+                        ]
+                    else:
+                        preds = predictor(context, targets, masks_enc, masks_pred)
 
 
                     preds = preds[0].view(num_videos,-1,*preds[0].shape[1:])
@@ -993,6 +1042,7 @@ def init_model(
     pred_checkpoint_key='predictor',
     use_mask_tokens=True,
     pred_embed_dim=384,
+    output_mode="mlp",
     pred_depth=12,
     num_mask_tokens=2,
     is_mae=False,
@@ -1041,6 +1091,7 @@ def init_model(
                 tubelet_size=tubelet_size,
                 embed_dim=encoder.backbone.embed_dim,
                 predictor_embed_dim=pred_embed_dim,
+                output_mode=output_mode,
                 num_tokens=1568,
                 num_chunks=8,
                 chunk_tokens=196,

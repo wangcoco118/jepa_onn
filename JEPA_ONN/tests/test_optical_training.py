@@ -242,6 +242,28 @@ class CliOverrideTests(unittest.TestCase):
             updated["distillation"]["target_node"], "attention_output"
         )
 
+    def test_feedback_disabled_cli_override_disables_feedback_and_memory(self):
+        config = {
+            "onn": {
+                "feedback_enabled": True,
+                "feedback_memory_enabled": True,
+            }
+        }
+        updated = _apply_cli_overrides(config, feedback_enabled=False)
+        self.assertFalse(updated["onn"]["feedback_enabled"])
+        self.assertFalse(updated["onn"]["feedback_memory_enabled"])
+
+    def test_feedback_enabled_cli_override_preserves_enabled_memory(self):
+        config = {
+            "onn": {
+                "feedback_enabled": False,
+                "feedback_memory_enabled": False,
+            }
+        }
+        updated = _apply_cli_overrides(config, feedback_enabled=True)
+        self.assertTrue(updated["onn"]["feedback_enabled"])
+        self.assertFalse(updated["onn"]["feedback_memory_enabled"])
+
 
 class WarningCleanupTests(unittest.TestCase):
     def test_tensor_video_transform_does_not_copy_construct_warning(self):

@@ -171,6 +171,7 @@ def main(args_eval, resume_preempt=False):
         optical_qkv=optical_qkv,
         predictor_checkpoint=predictor_checkpoint,
         predictor_type=args_eval.get("predictor_type", "onn_feedback"),
+        output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
         onn_feedback_config=args_eval.get(
             "onn", args_eval.get("onn_feedback", optical_qkv)
         ),
@@ -565,6 +566,7 @@ def init_model(
     optical_qkv=None,
     predictor_checkpoint=None,
     predictor_type="vit_transformer",
+    output_mode="mlp",
     onn_feedback_config=None,
 ):
     optical_qkv = optical_qkv or {}
@@ -597,6 +599,7 @@ def init_model(
                 tubelet_size=tubelet_size,
                 embed_dim=encoder.backbone.embed_dim,
                 predictor_embed_dim=pred_embed_dim,
+                output_mode=output_mode,
                 num_tokens=1568,
                 num_chunks=8,
                 chunk_tokens=196,

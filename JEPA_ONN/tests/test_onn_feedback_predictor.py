@@ -135,6 +135,39 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
             onn_core=RecordingONN(384),
         )
 
+    def test_output_modes_produce_1024_features_and_trace_mode(self):
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = full_masks()
+
+        for output_mode in ("mlp", "linear", "interpolate"):
+            with self.subTest(output_mode=output_mode):
+                predictor = ONNFeedbackPredictor(
+                    embed_dim=1024,
+                    predictor_embed_dim=384,
+                    num_tokens=1568,
+                    num_chunks=8,
+                    chunk_tokens=196,
+                    output_mlp_hidden_dim=384,
+                    output_mode=output_mode,
+                    onn_core=RecordingONN(384),
+                )
+                output = predictor(context, None, masks_ctxt, masks_tgt)
+
+                self.assertEqual(tuple(output.shape), (1, 1560, 1024))
+                self.assertEqual(predictor.last_trace["output_mode"], output_mode)
+
+    def test_invalid_output_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "output_mode"):
+            ONNFeedbackPredictor(
+                embed_dim=1024,
+                predictor_embed_dim=384,
+                num_tokens=1568,
+                num_chunks=8,
+                chunk_tokens=196,
+                output_mode="unsupported",
+                onn_core=RecordingONN(384),
+            )
+
     def test_forward_has_fixed_canvas_and_1024_output(self):
         predictor = self.make_predictor()
         context = torch.randn(1, 8, 1024)

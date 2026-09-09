@@ -52,6 +52,7 @@ predictor:
   num_chunks: 8
   chunk_tokens: 196
   output_mlp_hidden_dim: 384
+  output_mode: mlp
 
 onn:
   input_dim: 384
@@ -89,3 +90,4 @@ loss:
 
 evaluation:
   run_after_training: true
+  last_context_copy_baseline: false

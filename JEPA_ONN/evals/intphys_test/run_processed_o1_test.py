@@ -85,13 +85,69 @@ def _valid_unique_records(records, data_root):
     return selected
 
 
-def _checkpoint_config(checkpoint_path):
+def _transformer_eval_config(checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+    return {
+        "predictor_type": "vit_transformer",
+        "pretrain": {
+            "enc_checkpoint_key": "encoder",
+            "pred_checkpoint_key": "predictor",
+            "model_name": "vit_large",
+            "patch_size": 16,
+            "folder": str(checkpoint_path.parent),
+            "checkpoint": checkpoint_path.name,
+            "write_tag": "vjepa_vitl16_transformer",
+            "use_sdpa": True,
+            "use_silu": False,
+            "wide_silu": False,
+            "uniform_power": True,
+            "is_causal": False,
+            "pred_is_causal": False,
+            "pred_depth": 12,
+            "tubelet_size": 2,
+            "frames_per_clip": 16,
+        },
+        "data": {
+            "batch_size": 1,
+            "resolution": 224,
+            "stride_sliding_window": 2,
+            "use_bfloat16": True,
+            "frames_per_clip": 16,
+            "context_lengths": [2, 4, 6, 8, 10],
+            "frame_steps": 2,
+        },
+        "predictor": {
+            "predictor_dim": 384,
+            "output_dim": 1024,
+            "num_tokens": 1568,
+            "num_chunks": 8,
+            "chunk_tokens": 196,
+        },
+        "normalize_targets": True,
+    }
+
+
+def _checkpoint_config(checkpoint_path, predictor_type="onn_feedback"):
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"best checkpoint does not exist: {checkpoint_path}")
-    if checkpoint_path.name.endswith(".last.pt"):
+        raise FileNotFoundError(f"checkpoint does not exist: {checkpoint_path}")
+    if predictor_type not in {"onn_feedback", "vit_transformer"}:
+        raise ValueError(f"unsupported predictor_type: {predictor_type}")
+    if predictor_type == "onn_feedback" and checkpoint_path.name.endswith(".last.pt"):
         raise ValueError("refusing to use a .last.pt checkpoint; pass the best checkpoint")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if predictor_type == "vit_transformer":
+        required_keys = ("encoder", "target_encoder", "predictor")
+        missing_keys = [
+            key for key in required_keys
+            if not isinstance(checkpoint.get(key), dict)
+        ]
+        if missing_keys:
+            raise ValueError(
+                "Transformer checkpoint is missing state dictionaries: "
+                f"{missing_keys}"
+            )
+        return checkpoint, _transformer_eval_config(checkpoint_path), checkpoint_path
     if checkpoint.get("checkpoint_kind") != "best":
         raise ValueError(
             "refusing checkpoint without checkpoint_kind=best; "
@@ -144,12 +200,22 @@ def _freeze_eval(module):
 def _load_models(checkpoint_path, config, device):
     pretrain_cfg = config["pretrain"]
     predictor_cfg = config["predictor"]
-    onn_cfg = config.get("onn", config.get("onn_feedback"))
-    if not isinstance(onn_cfg, dict):
-        raise ValueError("saved checkpoint has no ONN configuration")
+    predictor_type = config.get("predictor_type", "onn_feedback")
+    if predictor_type == "onn_feedback":
+        onn_cfg = config.get("onn", config.get("onn_feedback"))
+        if not isinstance(onn_cfg, dict):
+            raise ValueError("saved checkpoint has no ONN configuration")
+        pretrained_path = Path(pretrain_cfg["folder"]) / pretrain_cfg["checkpoint"]
+        predictor_checkpoint = str(checkpoint_path)
+    elif predictor_type == "vit_transformer":
+        onn_cfg = None
+        pretrained_path = Path(checkpoint_path)
+        predictor_checkpoint = None
+    else:
+        raise ValueError(f"unsupported predictor_type: {predictor_type}")
     encoder, target_encoder, predictor = canonical_eval.init_model(
         device=device,
-        pretrained=str(Path(pretrain_cfg["folder"]) / pretrain_cfg["checkpoint"]),
+        pretrained=str(pretrained_path),
         model_name=pretrain_cfg["model_name"],
         patch_size=pretrain_cfg["patch_size"],
         crop_size=config["data"]["resolution"],
@@ -164,10 +230,11 @@ def _load_models(checkpoint_path, config, device):
         enc_checkpoint_key=pretrain_cfg.get("enc_checkpoint_key", "encoder"),
         pred_checkpoint_key=pretrain_cfg.get("pred_checkpoint_key", "predictor"),
         pred_embed_dim=predictor_cfg["predictor_dim"],
+        output_mode=predictor_cfg.get("output_mode", "mlp"),
         pred_depth=pretrain_cfg.get("pred_depth", 12),
         optical_qkv={},
-        predictor_checkpoint=str(checkpoint_path),
-        predictor_type="onn_feedback",
+        predictor_checkpoint=predictor_checkpoint,
+        predictor_type=predictor_type,
         onn_feedback_config=onn_cfg,
     )
     _freeze_eval(encoder)
@@ -345,7 +412,16 @@ def _write_answer(path, mapping, rows_by_relative_path, aggregation):
 
 def _build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True, help="best .pt checkpoint; .last.pt is rejected")
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="ONN best .pt or trained V-JEPA Transformer .pth.tar checkpoint",
+    )
+    parser.add_argument(
+        "--predictor-type",
+        choices=("onn_feedback", "vit_transformer"),
+        default="onn_feedback",
+    )
     parser.add_argument("--data-root", required=True, help="processed test_o1_rgbd_128_allframes directory")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--task-list", help="official task.txt; omit for local-only inference")
@@ -401,7 +477,10 @@ def main(argv=None):
     else:
         ordered_records = candidate_records
 
-    checkpoint, config, _ = _checkpoint_config(args.checkpoint)
+    checkpoint, config, _ = _checkpoint_config(
+        args.checkpoint,
+        predictor_type=args.predictor_type,
+    )
     data_cfg = config["data"]
     batch_size = int(args.batch_size or data_cfg.get("batch_size", 1))
     if batch_size < 1:
@@ -592,6 +671,7 @@ def main(argv=None):
         "score_direction": "lower_surprise_is_higher_plausibility",
         "score_transform": "exp(-aggregated_surprise)",
         "aggregation": args.aggregation,
+        "predictor_type": args.predictor_type,
         "checkpoint": str(Path(args.checkpoint)),
         "checkpoint_epoch": checkpoint.get("epoch"),
         "saved_config_contract": {
