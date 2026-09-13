@@ -79,6 +79,17 @@ def _unwrap_module(module):
     return module.module if isinstance(module, DistributedDataParallel) else module
 
 
+def _set_predictor_trainability(predictor):
+    for parameter in predictor.parameters():
+        parameter.requires_grad_(True)
+    model = _unwrap_module(predictor)
+    if hasattr(model, "backbone"):
+        model = model.backbone
+    if getattr(model, "direct_384_loss", False):
+        for parameter in model.predictor_embed.parameters():
+            parameter.requires_grad_(False)
+
+
 def _feedback_runtime_metadata(predictor):
     predictor_model = _unwrap_module(predictor)
     if hasattr(predictor_model, "backbone"):
@@ -1056,6 +1067,9 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
         optical_qkv={} if predictor_type == "onn_feedback" else optical_cfg,
         predictor_type=predictor_type,
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
+        direct_384_loss=args_eval.get("predictor", {}).get(
+            "direct_384_loss", False
+        ),
         onn_feedback_config=onn_cfg,
     )
     if predictor_type != "onn_feedback" and experiment_mode == "optical_qkv":
@@ -1070,8 +1084,7 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
         for parameter in module.parameters():
             parameter.requires_grad_(False)
     predictor.train()
-    for parameter in predictor.parameters():
-        parameter.requires_grad_(True)
+    _set_predictor_trainability(predictor)
     if predictor_type == "onn_feedback":
         assert all(not p.requires_grad for p in encoder.parameters())
         assert all(not p.requires_grad for p in target_encoder.parameters())
@@ -1129,6 +1142,7 @@ def _run_jepa_epoch(
         clips, context, targets, masks_ctxt, masks_tgt = _prepare_jepa_batch(
             batch, args_eval, encoder, target_encoder, device
         )
+        targets = vit_pred.project_targets_for_loss(predictor, targets)
         _sync_for_timing(device)
         feature_time = time.perf_counter() - feature_started
         predictor_started = time.perf_counter()

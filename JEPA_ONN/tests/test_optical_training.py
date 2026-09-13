@@ -27,6 +27,7 @@ from evals.intuitive_physics.train_optical import (
     _save_checkpoint,
     _require_existing_video_split,
     _resolve_gpu_ids,
+    _set_predictor_trainability,
 )
 from evals.intuitive_physics.optical_split import (
     build_video_split,
@@ -67,6 +68,53 @@ class MultiGpuSelectionTests(unittest.TestCase):
             _resolve_gpu_ids(gpu=0, gpus=[1, 2])
         with self.assertRaisesRegex(ValueError, "duplicate"):
             _resolve_gpu_ids(gpu=None, gpus=[1, 1])
+
+
+class Direct384TrainabilityTests(unittest.TestCase):
+    def test_shared_projection_stays_frozen_while_predictor_trains(self):
+        class TinyPredictor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.direct_384_loss = True
+                self.predictor_embed = torch.nn.Linear(4, 2)
+                self.head = torch.nn.Linear(2, 2)
+
+        predictor = TinyPredictor()
+        for parameter in predictor.parameters():
+            parameter.requires_grad_(False)
+
+        _set_predictor_trainability(predictor)
+
+        self.assertFalse(any(
+            parameter.requires_grad
+            for parameter in predictor.predictor_embed.parameters()
+        ))
+        self.assertTrue(all(
+            parameter.requires_grad
+            for parameter in predictor.head.parameters()
+        ))
+
+    def test_multimask_wrapper_keeps_shared_projection_frozen(self):
+        class TinyPredictor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.direct_384_loss = True
+                self.predictor_embed = torch.nn.Linear(4, 2)
+                self.head = torch.nn.Linear(2, 2)
+
+        from src.models.utils.multimask import PredictorMultiMaskWrapper
+
+        predictor = PredictorMultiMaskWrapper(TinyPredictor())
+        _set_predictor_trainability(predictor)
+
+        self.assertFalse(any(
+            parameter.requires_grad
+            for parameter in predictor.backbone.predictor_embed.parameters()
+        ))
+        self.assertTrue(all(
+            parameter.requires_grad
+            for parameter in predictor.backbone.head.parameters()
+        ))
 
 
 class DistributedLoaderContractTests(unittest.TestCase):

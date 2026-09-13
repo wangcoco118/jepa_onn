@@ -346,6 +346,9 @@ def main(args_eval, resume_preempt=False):
         predictor_checkpoint=predictor_checkpoint,
         predictor_type=args_eval.get("predictor_type", "onn_feedback"),
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
+        direct_384_loss=args_eval.get("predictor", {}).get(
+            "direct_384_loss", False
+        ),
         onn_feedback_config=args_eval.get(
             "onn", args_eval.get("onn_feedback", optical_qkv)
         ),
@@ -872,6 +875,9 @@ def extract_losses(
                             )
                         ]
                     else:
+                        targets = vit_pred.project_targets_for_loss(
+                            predictor, targets
+                        )
                         preds = predictor(context, targets, masks_enc, masks_pred)
 
 
@@ -1043,6 +1049,7 @@ def init_model(
     use_mask_tokens=True,
     pred_embed_dim=384,
     output_mode="mlp",
+    direct_384_loss=False,
     pred_depth=12,
     num_mask_tokens=2,
     is_mae=False,
@@ -1092,6 +1099,7 @@ def init_model(
                 embed_dim=encoder.backbone.embed_dim,
                 predictor_embed_dim=pred_embed_dim,
                 output_mode=output_mode,
+                direct_384_loss=direct_384_loss,
                 num_tokens=1568,
                 num_chunks=8,
                 chunk_tokens=196,

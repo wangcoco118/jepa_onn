@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -6,6 +8,7 @@ import torch.distributed as dist
 from evals.intuitive_physics import eval as dev_eval
 from evals.intuitive_physics import utils as dev_utils
 from evals.intphys_test import utils as test_utils
+from evals.intphys_test import eval as test_eval
 
 
 class EvalDistributedFallbackTests(unittest.TestCase):
@@ -77,6 +80,46 @@ class EvalDistributedFallbackTests(unittest.TestCase):
                     self.fail(f"single-process gather raised {exc!r}")
                 self.assertTrue(torch.equal(gathered, tensor))
                 self.assertEqual(gathered.data_ptr(), tensor.data_ptr())
+
+
+class TestInferenceLoggingTests(unittest.TestCase):
+    def test_configure_inference_logging_writes_output_root_log(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_path = test_eval._configure_inference_logging(tmp_dir)
+            try:
+                test_eval.logger.info("batch=1/2 processed=1 failures=0")
+                for handler in test_eval.logger.handlers:
+                    handler.flush()
+                contents = Path(log_path).read_text()
+            finally:
+                for handler in list(test_eval.logger.handlers):
+                    if getattr(handler, "_intphys_test_inference_handler", False):
+                        test_eval.logger.removeHandler(handler)
+                        handler.close()
+
+        self.assertEqual(Path(log_path).name, "inference.log")
+        self.assertIn("INFO | batch=1/2 processed=1 failures=0", contents)
+
+    def test_batch_progress_line_matches_compact_inference_format(self):
+        line = test_eval._format_batch_progress(
+            batch_index=8,
+            total_batches=4320,
+            movie_paths=["O1/0002/4"],
+            data_read_time_s=0.0454,
+            feature_time_s=0.3116,
+            onn_time_s=2.8257,
+            surprise=0.7121234,
+            plausibility=0.2878766,
+            processed=8,
+            failures=0,
+        )
+
+        self.assertEqual(
+            line,
+            "batch=8/4320 movie_path_range=O1/0002/4..O1/0002/4 "
+            "data_read_time_s=0.045 feature_time_s=0.312 onn_time_s=2.826 "
+            "surprise=0.712123 plausibility=0.287877 processed=8 failures=0",
+        )
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ import torch
 import torch.nn as nn
 
 from src.models.fsonn import FeedbackFSONN, ONNConfig, PhaseSLM
+from src.models import predictor as predictor_module
 from src.models.predictor import ONNFeedbackPredictor
+from src.models.utils.multimask import PredictorMultiMaskWrapper
 
 
 class RecordingONN(nn.Module):
@@ -155,6 +157,93 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
 
                 self.assertEqual(tuple(output.shape), (1, 1560, 1024))
                 self.assertEqual(predictor.last_trace["output_mode"], output_mode)
+
+    def test_direct_384_loss_returns_raw_384_prediction(self):
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            output_mode="mlp",
+            direct_384_loss=True,
+            onn_core=RecordingONN(384),
+        )
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = full_masks()
+
+        output = predictor(context, None, masks_ctxt, masks_tgt)
+
+        self.assertEqual(tuple(output.shape), (1, 1560, 384))
+        self.assertTrue(predictor.last_trace["direct_384_loss"])
+        self.assertEqual(predictor.last_trace["prediction_shape"], (1, 1560, 384))
+
+    def test_direct_384_loss_uses_frozen_shared_target_projection(self):
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            direct_384_loss=True,
+            onn_core=RecordingONN(384),
+        )
+        target = torch.randn(1, 7, 1024, requires_grad=True)
+
+        projected = predictor.project_target_features(target)
+        with torch.no_grad():
+            expected = torch.nn.functional.layer_norm(
+                predictor.predictor_embed(target), (384,)
+            )
+
+        self.assertFalse(any(
+            parameter.requires_grad
+            for parameter in predictor.predictor_embed.parameters()
+        ))
+        self.assertFalse(projected.requires_grad)
+        self.assertTrue(torch.allclose(projected, expected))
+
+    def test_project_targets_for_loss_tracks_direct_mode(self):
+        direct_predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            direct_384_loss=True,
+            onn_core=RecordingONN(384),
+        )
+        legacy_predictor = self.make_predictor()
+        targets = [torch.randn(1, 7, 1024)]
+
+        projected = predictor_module.project_targets_for_loss(
+            direct_predictor, targets
+        )
+        unchanged = predictor_module.project_targets_for_loss(
+            legacy_predictor, targets
+        )
+
+        self.assertEqual(tuple(projected[0].shape), (1, 7, 384))
+        self.assertFalse(projected[0].requires_grad)
+        self.assertIs(unchanged, targets)
+
+    def test_project_targets_for_loss_unwraps_multimask_predictor(self):
+        predictor = PredictorMultiMaskWrapper(ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            direct_384_loss=True,
+            onn_core=RecordingONN(384),
+        ))
+        targets = [torch.randn(1, 7, 1024)]
+
+        projected = predictor_module.project_targets_for_loss(
+            predictor, targets
+        )
+
+        self.assertEqual(tuple(projected[0].shape), (1, 7, 384))
 
     def test_invalid_output_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "output_mode"):

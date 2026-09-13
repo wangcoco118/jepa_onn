@@ -53,7 +53,7 @@ def slurm_account_partition_and_qos(low_pri: bool) -> str:
 
 DATASET_PATHS_BY_CLUSTER = {
     CLUSTER:{
-        'IntPhys-test': '/datasetsIntPhys/test/',
+        'IntPhys-test': '/data/linux/wkx/IntPhys/data/test/test/',
     }
 }
 

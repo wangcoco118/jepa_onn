@@ -1,4 +1,4 @@
-import csv
+import inspect
 import tempfile
 import unittest
 import zipfile
@@ -13,69 +13,75 @@ from evals.intphys_test.build_submission import (
 
 
 class SubmissionBuilderTests(unittest.TestCase):
-    def test_builds_average_and_maximum_lines_with_shared_random_o23(self):
+    def test_builds_lines_from_complete_real_o1_o2_o3_scores(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            csv_path = root / "per_movie_scores.csv"
+            answer_path = root / "maximum_surprise_answer.txt"
             task_path = root / "task.txt"
+            tasks = [
+                "O1/0001_O1_test_visible_static_nobj1/1",
+                "O1/0001_O1_test_visible_static_nobj1/2",
+                "O2/0001_O2_test_visible_static_nobj1/1",
+                "O2/0001_O2_test_visible_static_nobj1/2",
+                "O3/0001_O3_test_visible_static_nobj1/1",
+                "O3/0001_O3_test_visible_static_nobj1/2",
+            ]
             task_path.write_text(
+                "\n".join(tasks) + "\n",
+                encoding="utf-8",
+            )
+            answer_path.write_text(
                 "\n".join(
-                    [
-                        "O1/0001_O1_test_visible_static_nobj1/1",
-                        "O1/0001_O1_test_visible_static_nobj1/2",
-                        "O1/0001_O1_test_visible_static_nobj1/3",
-                        "O1/0001_O1_test_visible_static_nobj1/4",
-                        "O2/0001_O2_test_visible_static_nobj1/1",
-                        "O3/0001_O3_test_visible_static_nobj1/1",
-                    ]
+                    f"{task} {score}"
+                    for task, score in zip(
+                        reversed(tasks),
+                        ("0.91", "0.81", "0.71", "0.61", "0.51", "0.41"),
+                    )
                 )
                 + "\n",
                 encoding="utf-8",
             )
-            with csv_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=[
-                        "sample_id",
-                        "plausibility_average",
-                        "plausibility_maximum",
-                    ],
-                )
-                writer.writeheader()
-                for movie_id, average, maximum in (
-                    ("1", "0.10", "0.20"),
-                    ("2", "0.30", "0.40"),
-                    ("3", "0.50", "0.60"),
-                    ("4", "0.70", "0.80"),
-                ):
-                    writer.writerow(
-                        {
-                            "sample_id": f"O1/0001/{movie_id}",
-                            "plausibility_average": average,
-                            "plausibility_maximum": maximum,
-                        }
-                    )
 
-            average_lines = build_answer_lines(csv_path, task_path, "average", 42)
-            maximum_lines = build_answer_lines(csv_path, task_path, "maximum", 42)
+            lines = build_answer_lines(answer_path, task_path)
 
-            self.assertEqual(average_lines[:4], [
-                "O1/0001/1 0.1000000000",
-                "O1/0001/2 0.3000000000",
-                "O1/0001/3 0.5000000000",
-                "O1/0001/4 0.7000000000",
+            self.assertEqual(lines, [
+                "O1/0001/1 0.4100000000",
+                "O1/0001/2 0.5100000000",
+                "O2/0001/1 0.6100000000",
+                "O2/0001/2 0.7100000000",
+                "O3/0001/1 0.8100000000",
+                "O3/0001/2 0.9100000000",
             ])
-            self.assertEqual(maximum_lines[:4], [
-                "O1/0001/1 0.2000000000",
-                "O1/0001/2 0.4000000000",
-                "O1/0001/3 0.6000000000",
-                "O1/0001/4 0.8000000000",
-            ])
-            self.assertEqual(average_lines[4:], maximum_lines[4:])
-            for line in average_lines[4:]:
-                score = float(line.split()[1])
-                self.assertGreaterEqual(score, 0.0)
-                self.assertLessEqual(score, 1.0)
+
+    def test_missing_real_o2_o3_scores_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            answer_path = root / "average_surprise_answer.txt"
+            task_path = root / "task.txt"
+            task_path.write_text(
+                "\n".join([
+                    "O1/0001_O1_test_visible_static_nobj1/1",
+                    "O2/0001_O2_test_visible_static_nobj1/1",
+                    "O3/0001_O3_test_visible_static_nobj1/1",
+                ])
+                + "\n",
+                encoding="utf-8",
+            )
+            answer_path.write_text(
+                "O1/0001_O1_test_visible_static_nobj1/1 0.5\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "missing real scores.*O2/0001/1"
+            ):
+                build_answer_lines(answer_path, task_path)
+
+    def test_build_answer_lines_has_no_random_seed_parameter(self):
+        self.assertEqual(
+            list(inspect.signature(build_answer_lines).parameters),
+            ["answer_path", "task_path"],
+        )
 
     def test_output_defaults_to_o1_model_run_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

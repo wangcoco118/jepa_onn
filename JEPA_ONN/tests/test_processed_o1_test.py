@@ -6,7 +6,9 @@ from unittest import mock
 import torch
 from pathlib import Path
 
+from evals.intphys_test import eval as raw_test_eval
 from evals.intphys_test import run_processed_o1_test as runner
+from evals.intphys_test import utils as test_utils
 from evals.intphys_test.processed_test_support import (
     audit_manifest_records,
     build_task_mapping,
@@ -132,6 +134,54 @@ class ProcessedO1TestSupportTests(unittest.TestCase):
         self.assertEqual(kwargs["predictor_type"], "vit_transformer")
         self.assertEqual(kwargs["pretrained"], str(checkpoint_path))
         self.assertIsNone(kwargs["predictor_checkpoint"])
+
+    def test_direct_384_loss_flag_is_forwarded_to_model_builder(self):
+        checkpoint_path = Path("/models/onn.pt")
+        config = {
+            "predictor_type": "onn_feedback",
+            "pretrain": {
+                "folder": "/models",
+                "checkpoint": "encoder.pt",
+                "model_name": "vit_large",
+                "patch_size": 16,
+                "tubelet_size": 2,
+                "frames_per_clip": 16,
+            },
+            "data": {"resolution": 224, "frames_per_clip": 16},
+            "predictor": {
+                "predictor_dim": 384,
+                "direct_384_loss": True,
+            },
+            "onn": {},
+        }
+        modules = (torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity())
+        with mock.patch.object(
+            runner.canonical_eval,
+            "init_model",
+            return_value=modules,
+        ) as init_model:
+            runner._load_models(checkpoint_path, config, torch.device("cpu"))
+
+        self.assertTrue(init_model.call_args.kwargs["direct_384_loss"])
+
+
+class RawIntPhysTestPathTests(unittest.TestCase):
+    def test_real_plausibility_scores_are_clamped_to_official_range(self):
+        losses = torch.tensor([
+            [[0.2, 1.4], [0.4, 2.0]],
+        ])
+
+        metrics = raw_test_eval.compute_metrics(losses)
+
+        for scores in metrics.values():
+            self.assertTrue(torch.all(scores >= 0.0))
+            self.assertTrue(torch.all(scores <= 1.0))
+
+    def test_raw_test_path_points_to_extracted_local_dataset(self):
+        self.assertEqual(
+            test_utils.get_dataset_path("IntPhys-test"),
+            "/data/linux/wkx/IntPhys/data/test/test/",
+        )
 
 
 if __name__ == "__main__":

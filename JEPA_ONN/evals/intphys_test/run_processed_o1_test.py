@@ -231,6 +231,7 @@ def _load_models(checkpoint_path, config, device):
         pred_checkpoint_key=pretrain_cfg.get("pred_checkpoint_key", "predictor"),
         pred_embed_dim=predictor_cfg["predictor_dim"],
         output_mode=predictor_cfg.get("output_mode", "mlp"),
+        direct_384_loss=predictor_cfg.get("direct_384_loss", False),
         pred_depth=pretrain_cfg.get("pred_depth", 12),
         optical_qkv={},
         predictor_checkpoint=predictor_checkpoint,
@@ -342,6 +343,9 @@ def _infer_batch(clips, config, encoder, target_encoder, predictor, device):
                 context = [F.layer_norm(value, (value.shape[-1],)) for value in context]
             onn_started = time.perf_counter()
             feature_time_total += onn_started - feature_started
+            targets = canonical_eval.vit_pred.project_targets_for_loss(
+                predictor, targets
+            )
             predictions = predictor(context, targets, masks_ctxt, masks_tgt)
             onn_time_total += time.perf_counter() - onn_started
             pred = predictions[0].view(num_movies, num_windows, *predictions[0].shape[1:])

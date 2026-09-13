@@ -1,16 +1,13 @@
-"""Build official-format IntPhys submissions from processed O1 scores.
+"""Package complete real IntPhys Test predictions in official format.
 
-The O1 values come from an existing per_movie_scores.csv. O2 and O3 are
-filled with deterministic random values in [0, 1] because this utility is
-intended for an O1-focused submission experiment. The official validator is
-run separately for the average and maximum submissions.
+Both input answer files must come from real model inference and must cover every
+O1, O2, and O3 task exactly once. Missing or extra scores are rejected; this
+utility never synthesizes placeholder scores.
 """
 
 import argparse
-import csv
 from datetime import datetime
 import math
-import random
 import subprocess
 import sys
 import tempfile
@@ -18,40 +15,6 @@ import zipfile
 from pathlib import Path
 
 from evals.intphys_test.convert_submission_paths import canonical_movie_path
-
-
-_SCORE_COLUMNS = {
-    "average": "plausibility_average",
-    "maximum": "plausibility_maximum",
-}
-
-
-def _read_o1_scores(csv_path, score_column):
-    required = {"sample_id", score_column}
-    scores = {}
-    with Path(csv_path).open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-            missing = sorted(required.difference(reader.fieldnames or []))
-            raise ValueError(f"CSV is missing required columns: {missing}")
-        for row_number, row in enumerate(reader, start=2):
-            sample_id = (row.get("sample_id") or "").strip()
-            if not sample_id.startswith("O1/"):
-                continue
-            if sample_id in scores:
-                raise ValueError(f"duplicate O1 sample_id at row {row_number}: {sample_id}")
-            try:
-                score = float(row[score_column])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"invalid {score_column} at row {row_number}: {sample_id}"
-                ) from exc
-            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-                raise ValueError(f"score outside [0, 1] at row {row_number}: {sample_id}")
-            scores[sample_id] = score
-    if not scores:
-        raise ValueError(f"no O1 scores found in {csv_path}")
-    return scores
 
 
 def _read_tasks(task_path):
@@ -62,45 +25,67 @@ def _read_tasks(task_path):
     ]
 
 
-def _sample_id_from_official_task(task):
-    parts = task.split("/")
-    if len(parts) != 3 or parts[0] != "O1" or parts[2] not in {"1", "2", "3", "4"}:
-        raise ValueError(f"invalid O1 official task path: {task}")
-    scene_id = parts[1].split("_", 1)[0]
-    if len(scene_id) != 4 or not scene_id.isdigit():
-        raise ValueError(f"cannot map O1 scene id from task path: {task}")
-    return f"O1/{scene_id}/{parts[2]}"
-
-
-def build_answer_lines(csv_path, task_path, aggregation, seed):
-    if aggregation not in _SCORE_COLUMNS:
-        raise ValueError(f"unsupported aggregation: {aggregation}")
-    o1_scores = _read_o1_scores(csv_path, _SCORE_COLUMNS[aggregation])
-    tasks = _read_tasks(task_path)
-    rng = random.Random(seed)
-    lines = []
-
-    for task in tasks:
-        official_task = canonical_movie_path(task)
-        block = official_task.split("/", 1)[0]
-        if block == "O1":
-            sample_id = _sample_id_from_official_task(task)
-            if sample_id not in o1_scores:
+def _read_real_scores(answer_path):
+    scores = {}
+    with Path(answer_path).open(encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            fields = raw_line.split()
+            if len(fields) != 2:
                 raise ValueError(
-                    f"missing {aggregation} O1 score for {task} -> {sample_id}"
+                    f"invalid answer line {line_number}: expected path and score"
                 )
-            score = o1_scores[sample_id]
-        elif block in {"O2", "O3"}:
-            score = rng.uniform(0.0, 1.0)
-        else:
-            raise ValueError(f"unsupported block in task file: {task}")
-        lines.append(f"{official_task} {score:.10f}")
+            movie_path = canonical_movie_path(fields[0])
+            if movie_path in scores:
+                raise ValueError(
+                    f"duplicate score at line {line_number}: {movie_path}"
+                )
+            try:
+                score = float(fields[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid score at line {line_number}: {fields[1]!r}"
+                ) from exc
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                raise ValueError(
+                    f"score outside [0, 1] at line {line_number}: {movie_path}"
+                )
+            scores[movie_path] = score
+    if not scores:
+        raise ValueError(f"no real scores found in {answer_path}")
+    return scores
 
-    return lines
+
+def build_answer_lines(answer_path, task_path):
+    scores = _read_real_scores(answer_path)
+    tasks = _read_tasks(task_path)
+    canonical_tasks = [canonical_movie_path(task) for task in tasks]
+
+    if len(set(canonical_tasks)) != len(canonical_tasks):
+        raise ValueError("task file contains duplicate canonical movie paths")
+
+    task_set = set(canonical_tasks)
+    missing = [task for task in canonical_tasks if task not in scores]
+    if missing:
+        raise ValueError(
+            f"missing real scores for {len(missing)} tasks; first: {missing[0]}"
+        )
+
+    extra = sorted(set(scores).difference(task_set))
+    if extra:
+        raise ValueError(
+            f"scores contain {len(extra)} tasks absent from task file; "
+            f"first: {extra[0]}"
+        )
+
+    return [f"{task} {scores[task]:.10f}" for task in canonical_tasks]
 
 
-def resolve_output_dir(csv_path, output_dir=None, output_name="submission_average_maximum"):
-    run_dir = Path(csv_path).resolve().parent
+def resolve_output_dir(
+    answer_path,
+    output_dir=None,
+    output_name="submission_average_maximum",
+):
+    run_dir = Path(answer_path).resolve().parent
     if output_dir is None:
         if not output_name or Path(output_name).name != output_name:
             raise ValueError("output_name must be a single directory name")
@@ -109,24 +94,24 @@ def resolve_output_dir(csv_path, output_dir=None, output_name="submission_averag
         resolved = Path(output_dir).resolve()
         if resolved.parent != run_dir:
             raise ValueError(
-                "output_dir must be a direct child of the O1 model run directory: "
+                "output_dir must be a direct child of the model run directory: "
                 f"{run_dir}"
             )
     return resolved
 
 
-def _infer_model_name(csv_path):
-    resolved = Path(csv_path).resolve()
+def _infer_model_name(answer_path):
+    resolved = Path(answer_path).resolve()
     for parent in resolved.parents:
-        if parent.name.startswith(('onn_', 'o1_')):
+        if parent.name.startswith(("onn_", "o1_", "transformer_")):
             return parent.name
     return resolved.parent.name
 
 
-def _submission_zip_name(csv_path, aggregation, generated_at):
-    if aggregation not in _SCORE_COLUMNS:
+def _submission_zip_name(answer_path, aggregation, generated_at):
+    if aggregation not in {"average", "maximum"}:
         raise ValueError(f"unsupported aggregation: {aggregation}")
-    model_name = _infer_model_name(csv_path)
+    model_name = _infer_model_name(answer_path)
     timestamp = generated_at.strftime("%Y%m%d_%H%M%S")
     return f"{model_name}_{timestamp}_{aggregation}.zip"
 
@@ -135,7 +120,9 @@ def write_submission_zip(answer_path, zip_path):
     answer_path = Path(answer_path)
     zip_path = Path(zip_path)
     zip_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(
+        zip_path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as archive:
         archive.write(answer_path, arcname="answer.txt")
 
 
@@ -162,34 +149,51 @@ def run_official_validator(validator_path, zip_path, task_path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--o1-csv", required=True, type=Path)
+    parser.add_argument(
+        "--average-answer",
+        required=True,
+        type=Path,
+        help="real average_surprise_answer.txt from raw Test inference",
+    )
+    parser.add_argument(
+        "--maximum-answer",
+        required=True,
+        type=Path,
+        help="real maximum_surprise_answer.txt from raw Test inference",
+    )
     parser.add_argument("--task-file", required=True, type=Path)
     parser.add_argument("--validator", required=True, type=Path)
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
-        help="direct child of the O1 model run directory; defaults to "
-        "<O1 CSV directory>/submission_average_maximum",
+        help="direct child of the model run directory",
     )
     parser.add_argument(
         "--output-name",
         default="submission_average_maximum",
-        help="default output directory name under the O1 model run directory",
+        help="output directory name under the model run directory",
     )
-    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
 
-    for path, label in (
-        (args.o1_csv, "O1 CSV"),
+    for source, label in (
+        (args.average_answer, "average real answer"),
+        (args.maximum_answer, "maximum real answer"),
         (args.task_file, "task file"),
         (args.validator, "validator"),
     ):
-        if not path.is_file():
-            raise FileNotFoundError(f"{label} does not exist: {path}")
+        if not source.is_file():
+            raise FileNotFoundError(f"{label} does not exist: {source}")
+
+    average_parent = args.average_answer.resolve().parent
+    maximum_parent = args.maximum_answer.resolve().parent
+    if average_parent != maximum_parent:
+        raise ValueError(
+            "average and maximum answer files must belong to the same model run"
+        )
 
     output_dir = resolve_output_dir(
-        args.o1_csv,
+        args.average_answer,
         args.output_dir,
         args.output_name,
     )
@@ -199,39 +203,51 @@ def main(argv=None):
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    canonical_tasks = [canonical_movie_path(task) for task in _read_tasks(args.task_file)]
+    canonical_tasks = [
+        canonical_movie_path(task)
+        for task in _read_tasks(args.task_file)
+    ]
     if len(set(canonical_tasks)) != len(canonical_tasks):
         raise ValueError("task file contains duplicate canonical movie paths")
 
     failed = False
     generated_at = datetime.now()
+    sources = {
+        "average": args.average_answer,
+        "maximum": args.maximum_answer,
+    }
     with tempfile.TemporaryDirectory(prefix="intphys_task_") as temp_dir:
         validation_task = Path(temp_dir) / "task.txt"
         validation_task.write_text(
             "\n".join(canonical_tasks) + "\n",
             encoding="utf-8",
         )
-        for aggregation in ("average", "maximum"):
+        for aggregation, source_answer in sources.items():
             mode_dir = output_dir / aggregation
             mode_dir.mkdir()
             answer_path = mode_dir / "answer.txt"
             zip_path = mode_dir / _submission_zip_name(
-                args.o1_csv, aggregation, generated_at
+                source_answer, aggregation, generated_at
             )
-            lines = build_answer_lines(
-                args.o1_csv, args.task_file, aggregation, args.seed
+            lines = build_answer_lines(source_answer, args.task_file)
+            answer_path.write_text(
+                "\n".join(lines) + "\n",
+                encoding="utf-8",
             )
-            answer_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             write_submission_zip(answer_path, zip_path)
             print(f"[{aggregation}] answer: {answer_path}")
             print(f"[{aggregation}] zip: {zip_path}")
             print(f"[{aggregation}] validator:")
-            if not run_official_validator(args.validator, zip_path, validation_task):
+            if not run_official_validator(
+                args.validator, zip_path, validation_task
+            ):
                 failed = True
-                print(f"[{aggregation}] validation failed", file=sys.stderr)
+                print(
+                    f"[{aggregation}] validation failed",
+                    file=sys.stderr,
+                )
             else:
                 print(f"[{aggregation}] validation passed")
-
     if failed:
         raise SystemExit(1)
 

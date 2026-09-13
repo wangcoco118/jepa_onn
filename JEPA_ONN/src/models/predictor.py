@@ -406,6 +406,7 @@ class ONNFeedbackPredictor(nn.Module):
         chunk_tokens=196,
         output_mlp_hidden_dim=384,
         output_mode="mlp",
+        direct_384_loss=False,
         feedback_mode="fixed_middle_phase",
         feedback_layer_mode=None,
         feedback_layer_index=None,
@@ -442,10 +443,16 @@ class ONNFeedbackPredictor(nn.Module):
                 "output_mode must be one of: 'mlp', 'linear', 'interpolate'"
             )
         self.output_mode = output_mode
+        if not isinstance(direct_384_loss, bool):
+            raise TypeError("direct_384_loss must be a boolean")
+        self.direct_384_loss = direct_384_loss
 
         self.predictor_embed = nn.Linear(
             self.embed_dim, self.predictor_embed_dim, bias=True
         )
+        if self.direct_384_loss:
+            for parameter in self.predictor_embed.parameters():
+                parameter.requires_grad_(False)
         self.mask_token = nn.Parameter(
             torch.zeros(1, 1, self.predictor_embed_dim)
         )
@@ -680,6 +687,17 @@ class ONNFeedbackPredictor(nn.Module):
             missing_counts.append(self.num_tokens - unique_count)
         return covered_counts, missing_counts
 
+    def project_target_features(self, target):
+        if target.ndim != 3 or target.shape[-1] != self.embed_dim:
+            raise ValueError(
+                f"target must have shape [B,N,{self.embed_dim}]"
+            )
+        with torch.no_grad():
+            target_384 = self.predictor_embed(target)
+            return F.layer_norm(
+                target_384, (self.predictor_embed_dim,)
+            )
+
     def forward(
         self,
         ctxt,
@@ -789,10 +807,15 @@ class ONNFeedbackPredictor(nn.Module):
             1,
             masks_tgt.unsqueeze(-1).expand(-1, -1, self.predictor_embed_dim),
         )
-        if self.output_mode == "mlp":
+        pred_tgt_1024 = None
+        if self.direct_384_loss:
+            prediction = pred_tgt_384
+        elif self.output_mode == "mlp":
             pred_tgt_1024 = self.output_mlp(pred_tgt_384)
+            prediction = pred_tgt_1024
         elif self.output_mode == "linear":
             pred_tgt_1024 = self.output_linear(pred_tgt_384)
+            prediction = pred_tgt_1024
         else:
             batch_size, num_target_tokens, input_dim = pred_tgt_384.shape
             pred_tgt_1024 = F.interpolate(
@@ -805,6 +828,7 @@ class ONNFeedbackPredictor(nn.Module):
             ).reshape(
                 batch_size, num_target_tokens, self.embed_dim
             )
+            prediction = pred_tgt_1024
         self.last_trace = {
             "ctxt_shape": tuple(ctxt.shape),
             "context_384_shape": tuple(context_384.shape),
@@ -812,8 +836,14 @@ class ONNFeedbackPredictor(nn.Module):
             "chunk_shape": tuple(chunks.shape),
             "dense_output_shape": tuple(dense_output.shape),
             "pred_tgt_384_shape": tuple(pred_tgt_384.shape),
-            "pred_tgt_1024_shape": tuple(pred_tgt_1024.shape),
+            "pred_tgt_1024_shape": (
+                tuple(pred_tgt_1024.shape)
+                if pred_tgt_1024 is not None
+                else None
+            ),
+            "prediction_shape": tuple(prediction.shape),
             "output_mode": self.output_mode,
+            "direct_384_loss": self.direct_384_loss,
             "n_ctxt": int(masks_ctxt.shape[1]),
             "n_tgt": int(masks_tgt.shape[1]),
             "covered_count": (
@@ -836,7 +866,19 @@ class ONNFeedbackPredictor(nn.Module):
             "feedback_memory_alpha": self.feedback_memory_alpha,
             "feedback_mode": self.feedback_mode,
         }
-        return pred_tgt_1024
+        return prediction
+
+
+def project_targets_for_loss(predictor, targets):
+    model = predictor.module if hasattr(predictor, "module") else predictor
+    if (
+        hasattr(model, "backbone")
+        and hasattr(model.backbone, "project_target_features")
+    ):
+        model = model.backbone
+    if not getattr(model, "direct_384_loss", False):
+        return targets
+    return [model.project_target_features(target) for target in targets]
 
 
 def install_optical_qkv(

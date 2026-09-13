@@ -20,6 +20,7 @@ except Exception:
 
 import logging
 import pprint
+import time
 
 import numpy as np
 from einops import rearrange
@@ -69,6 +70,51 @@ torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 pp = pprint.PrettyPrinter(indent=4)
+
+
+def _configure_inference_logging(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "inference.log")
+    for handler in list(logger.handlers):
+        if getattr(handler, "_intphys_test_inference_handler", False):
+            logger.removeHandler(handler)
+            handler.close()
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    )
+    file_handler._intphys_test_inference_handler = True
+    logger.addHandler(file_handler)
+    return log_path
+
+
+def _format_batch_progress(
+    *,
+    batch_index,
+    total_batches,
+    movie_paths,
+    data_read_time_s,
+    feature_time_s,
+    onn_time_s,
+    surprise,
+    plausibility,
+    processed,
+    failures,
+):
+    return (
+        f"batch={batch_index}/{total_batches} "
+        f"movie_path_range={movie_paths[0]}..{movie_paths[-1]} "
+        f"data_read_time_s={data_read_time_s:.3f} "
+        f"feature_time_s={feature_time_s:.3f} "
+        f"onn_time_s={onn_time_s:.3f} "
+        f"surprise={surprise:.6f} plausibility={plausibility:.6f} "
+        f"processed={processed} failures={failures}"
+    )
+
+
+def _synchronize_device(device):
+    if getattr(device, "type", None) == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def main(args_eval, resume_preempt=False):
@@ -142,11 +188,23 @@ def main(args_eval, resume_preempt=False):
     logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
 
     # -- log/checkpointing paths
-    folder = args_eval.get("output_dir") or os.path.join(pretrain_folder, 'intphys_test/')
+    output_root = args_eval.get("output_dir") or os.path.join(
+        pretrain_folder, "intphys_test/"
+    )
+    folder = output_root
     if eval_tag is not None:
         folder = os.path.join(folder, f"{dataset}-{eval_tag}")
-    if not os.path.exists(folder):
-        os.makedirs(folder, exist_ok=True)
+    os.makedirs(folder, exist_ok=True)
+    if rank == 0:
+        log_path = _configure_inference_logging(output_root)
+        logger.info(
+            "run_start dataset=%s checkpoint=%s batch_size=%d output_dir=%s log=%s",
+            dataset,
+            predictor_checkpoint,
+            batch_size,
+            folder,
+            log_path,
+        )
     # Initialize model
 
     # -- pretrained encoder (frozen)
@@ -172,6 +230,9 @@ def main(args_eval, resume_preempt=False):
         predictor_checkpoint=predictor_checkpoint,
         predictor_type=args_eval.get("predictor_type", "onn_feedback"),
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
+        direct_384_loss=args_eval.get("predictor", {}).get(
+            "direct_384_loss", False
+        ),
         onn_feedback_config=args_eval.get(
             "onn", args_eval.get("onn_feedback", optical_qkv)
         ),
@@ -228,7 +289,8 @@ def main(args_eval, resume_preempt=False):
                 mae_decoder_blocks=mae_decoder_blocks,
                 patch_size=patch_size,
                 resolution=resolution,
-                normalize_targets=normalize_targets)
+                normalize_targets=normalize_targets,
+                log_progress=(rank == 0))
             
             all_losses = batch_all_gather(all_losses).cpu()
             all_labels = batch_all_gather(all_labels).cpu().numpy().astype(int)
@@ -261,10 +323,9 @@ def main(args_eval, resume_preempt=False):
                     # Save to CSV without headers
                     log_file = os.path.join(folder, f'{metric}_answer.txt')
                     df.to_csv(log_file, index=False, header=False,sep=" ")
-            
-        
-        
 
+    if rank == 0:
+        logger.info("run_done output_dir=%s", folder)
 
 
 @torch.no_grad()
@@ -288,7 +349,8 @@ def extract_losses(
     mae_decoder_blocks=-1,
     patch_size=16,
     resolution=224,
-    normalize_targets=True
+    normalize_targets=True,
+    log_progress=True,
 ):
     print(context_lengths)
 
@@ -316,17 +378,30 @@ def extract_losses(
 
 
     loader = iter(data)
+    total_batches = len(loader)
 
     all_tasks = []
     all_losses = []
+    processed = 0
+    failures = 0
+    if log_progress:
+        logger.info(
+            "data_ready tasks=%d batches=%d batch_size=%d",
+            len(data.dataset),
+            total_batches,
+            batch_size,
+        )
 
-    for i in range(len(loader)):
+    for i in range(total_batches):
+        data_read_started = time.perf_counter()
         udata = next(loader)
 
         tasks = udata[1]
 
         clip = udata[0]
         clip = clip.to(device)
+        _synchronize_device(device)
+        data_read_time_s = time.perf_counter() - data_read_started
 
         #Batch size
         num_videos = clip.shape[0]
@@ -342,6 +417,8 @@ def extract_losses(
 
         
         all_losses_ctxt = []
+        feature_time_s = 0.0
+        onn_time_s = 0.0
         for CTXT_LEN in context_lengths:
 
             m,m_,full_m = get_time_masks(CTXT_LEN,spatial_size=(patch_size,patch_size),temporal_dim=frames_per_clip,as_bool=is_mae)
@@ -384,6 +461,8 @@ def extract_losses(
                     targets = targets.view(num_videos,-1,*targets.shape[1:])
 
                 else:
+                    _synchronize_device(device)
+                    feature_started = time.perf_counter()
                     h = target_encoder(pieces,full_mask)[0]
                     if normalize_targets:
                         h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim  [B, N, D]
@@ -397,9 +476,16 @@ def extract_losses(
                         for zi in context:
                             z_ += [F.layer_norm(zi,(zi.size(-1),))]
                         context = z_
+                    _synchronize_device(device)
+                    feature_time_s += time.perf_counter() - feature_started
 
+                    onn_started = time.perf_counter()
+                    targets = vit_pred.project_targets_for_loss(
+                        predictor, targets
+                    )
                     preds = predictor(context, targets, masks_enc, masks_pred)
-
+                    _synchronize_device(device)
+                    onn_time_s += time.perf_counter() - onn_started
 
                     preds = preds[0].view(num_videos,-1,*preds[0].shape[1:])
                     targets = targets[0].view(num_videos,-1,*targets[0].shape[1:])
@@ -411,6 +497,26 @@ def extract_losses(
         # i.e. all_losses[all_labels == 0] and 1 are matched pairwise
         all_losses.append(losses)
         all_tasks.append(tasks)
+        if log_progress:
+            task_indices = tasks.detach().cpu().flatten().numpy().astype(int)
+            movie_paths = [data.dataset.tasks[index] for index in task_indices]
+            surprise = losses.min(1)[0].mean().item()
+            plausibility = float(np.clip(1.0 - surprise, 0.0, 1.0))
+            processed += num_videos
+            logger.info(
+                _format_batch_progress(
+                    batch_index=i + 1,
+                    total_batches=total_batches,
+                    movie_paths=movie_paths,
+                    data_read_time_s=data_read_time_s,
+                    feature_time_s=feature_time_s,
+                    onn_time_s=onn_time_s,
+                    surprise=surprise,
+                    plausibility=plausibility,
+                    processed=processed,
+                    failures=failures,
+                )
+            )
     # This padding is only used for InfLevel but ensures easy processing
     # The padding can be removed by filtering end zeros since the loss is never zero
     # This can lead to slighlty innacurate metrics computed from this script
@@ -436,8 +542,8 @@ def extract_losses(
 def compute_metrics(losses):
     metrics = {}
 
-    average_losses = 1-losses.mean(1)
-    max_losses = 1-losses.max(1)[0]
+    average_losses = (1 - losses.mean(1)).clamp(0.0, 1.0)
+    max_losses = (1 - losses.max(1)[0]).clamp(0.0, 1.0)
 
     metrics["maximum_surprise"] = max_losses
     metrics["average_surprise"] = average_losses
@@ -567,6 +673,7 @@ def init_model(
     predictor_checkpoint=None,
     predictor_type="vit_transformer",
     output_mode="mlp",
+    direct_384_loss=False,
     onn_feedback_config=None,
 ):
     optical_qkv = optical_qkv or {}
@@ -600,6 +707,7 @@ def init_model(
                 embed_dim=encoder.backbone.embed_dim,
                 predictor_embed_dim=pred_embed_dim,
                 output_mode=output_mode,
+                direct_384_loss=direct_384_loss,
                 num_tokens=1568,
                 num_chunks=8,
                 chunk_tokens=196,
