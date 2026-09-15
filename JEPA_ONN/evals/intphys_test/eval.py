@@ -72,6 +72,37 @@ torch.backends.cudnn.benchmark = True
 pp = pprint.PrettyPrinter(indent=4)
 
 
+def _last_context_copy_enabled(args_eval):
+    value = (args_eval.get("evaluation") or {}).get(
+        "last_context_copy_baseline", False
+    )
+    if not isinstance(value, bool):
+        raise TypeError("evaluation.last_context_copy_baseline must be a boolean")
+    return value
+
+
+def _last_context_copy_prediction(
+    context,
+    num_target_tokens,
+    spatial_tokens,
+    normalize=True,
+):
+    if context.ndim != 3:
+        raise ValueError("context must have shape [B,N,D]")
+    if spatial_tokens <= 0:
+        raise ValueError("spatial_tokens must be positive")
+    if context.shape[1] < spatial_tokens or context.shape[1] % spatial_tokens != 0:
+        raise ValueError("context must contain complete spatial token slices")
+    if num_target_tokens <= 0 or num_target_tokens % spatial_tokens != 0:
+        raise ValueError("target must contain complete spatial token slices")
+
+    last_context = context[:, -spatial_tokens:, :]
+    if normalize:
+        last_context = F.layer_norm(last_context, (last_context.size(-1),))
+    future_steps = num_target_tokens // spatial_tokens
+    return last_context.repeat(1, future_steps, 1)
+
+
 def _configure_inference_logging(output_dir):
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, "inference.log")
@@ -171,6 +202,7 @@ def main(args_eval, resume_preempt=False):
     is_mae = args_eval.get('is_mae', False)
     mae_decoder_blocks = args_eval.get('mae_decoder_blocks', -1)
     normalize_targets =args_eval.get('normalize_targets',True)
+    last_context_copy_baseline = _last_context_copy_enabled(args_eval)
     # ----------------------------------------------------------------------- #
 
     try:
@@ -198,10 +230,12 @@ def main(args_eval, resume_preempt=False):
     if rank == 0:
         log_path = _configure_inference_logging(output_root)
         logger.info(
-            "run_start dataset=%s checkpoint=%s batch_size=%d output_dir=%s log=%s",
+            "run_start dataset=%s checkpoint=%s batch_size=%d "
+            "prediction_mode=%s output_dir=%s log=%s",
             dataset,
             predictor_checkpoint,
             batch_size,
+            "last_context_copy" if last_context_copy_baseline else "predictor",
             folder,
             log_path,
         )
@@ -290,6 +324,7 @@ def main(args_eval, resume_preempt=False):
                 patch_size=patch_size,
                 resolution=resolution,
                 normalize_targets=normalize_targets,
+                last_context_copy_baseline=last_context_copy_baseline,
                 log_progress=(rank == 0))
             
             all_losses = batch_all_gather(all_losses).cpu()
@@ -350,6 +385,7 @@ def extract_losses(
     patch_size=16,
     resolution=224,
     normalize_targets=True,
+    last_context_copy_baseline=False,
     log_progress=True,
 ):
     print(context_lengths)
@@ -480,10 +516,27 @@ def extract_losses(
                     feature_time_s += time.perf_counter() - feature_started
 
                     onn_started = time.perf_counter()
-                    targets = vit_pred.project_targets_for_loss(
-                        predictor, targets
-                    )
-                    preds = predictor(context, targets, masks_enc, masks_pred)
+                    if last_context_copy_baseline:
+                        if resolution % patch_size != 0:
+                            raise ValueError(
+                                "resolution must be divisible by patch_size"
+                            )
+                        spatial_tokens = (resolution // patch_size) ** 2
+                        preds = [
+                            _last_context_copy_prediction(
+                                context[0],
+                                num_target_tokens=masks_pred[0].shape[1],
+                                spatial_tokens=spatial_tokens,
+                                normalize=normalize_targets,
+                            )
+                        ]
+                    else:
+                        targets = vit_pred.project_targets_for_loss(
+                            predictor, targets
+                        )
+                        preds = predictor(
+                            context, targets, masks_enc, masks_pred
+                        )
                     _synchronize_device(device)
                     onn_time_s += time.perf_counter() - onn_started
 

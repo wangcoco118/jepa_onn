@@ -348,8 +348,10 @@ class FeedbackFSONN(nn.Module):
         feedback_state: Optional[torch.Tensor] = None,
         feedback_layer_index: Optional[int] = None,
         feedback_layer_indices: Optional[Sequence[int]] = None,
+        return_debug: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        field = self._encode(slot)
+        encoded_input = self._encode(slot)
+        field = encoded_input
         field = band_limited_angular_spectrum(
             field,
             self.config.input_to_first_slm_um,
@@ -366,54 +368,79 @@ class FeedbackFSONN(nn.Module):
                 "feedback and feedback_state are mutually exclusive"
             )
         feedback_phases = {}
+        feedback_state_for_trace = None
+        feedback_source_kind = "none"
         if feedback is not None:
             if feedback.shape != slot.shape:
                 raise ValueError("feedback must match the current slot shape")
             feedback_phases = self._feedback_to_phases(feedback)
+            if return_debug:
+                feedback_state_for_trace = self.normalize_feedback_output(feedback)
+            feedback_source_kind = "previous_output"
         elif feedback_state is not None:
             if feedback_state.shape != slot.shape:
                 raise ValueError(
                     "feedback_state must match the current slot shape"
                 )
             feedback_phases = self._feedback_state_to_phases(feedback_state)
+            if return_debug:
+                feedback_state_for_trace = feedback_state
+            feedback_source_kind = "memory_state"
         feedback_phase = (
             next(iter(feedback_phases.values()))
             if len(feedback_phases) == 1
             else None
         )
-        phase_abs_max = (
-            torch.stack(
-                [phase.abs().max() for phase in feedback_phases.values()]
-            ).max()
-            if feedback_phases
-            else torch.zeros((), device=slot.device, dtype=slot.dtype)
-        )
-        debug = {
-            "feedback_gain": self._effective_feedback_gains(),
-            "feedback_phase": feedback_phase,
-            "feedback_phases": feedback_phases,
-            "feedback_phase_abs_max": phase_abs_max,
-            "feedback_layer_index": (
-                selected_indices[0]
-                if self.config.feedback_layer_mode == "single"
-                else None
-            ),
-            "feedback_layer_indices": selected_indices,
-            "feedback_layer_mode": self.config.feedback_layer_mode,
-            "feedback_gain_mode": self.config.feedback_gain_mode,
-            "feedback_used": (
-                (feedback is not None or feedback_state is not None)
-                and bool(feedback_phases)
-            ),
-            "feedback_source_kind": (
-                "normalized_memory"
-                if feedback_state is not None
-                else ("previous_output" if feedback is not None else None)
-            ),
-        }
+        debug = {}
+        if return_debug:
+            phase_abs_max = (
+                torch.stack(
+                    [phase.abs().max() for phase in feedback_phases.values()]
+                ).max()
+                if feedback_phases
+                else torch.zeros((), device=slot.device, dtype=slot.dtype)
+            )
+            debug = {
+                "input_phase": torch.angle(encoded_input),
+                "input_amplitude": encoded_input.abs(),
+                "feedback_gain": self._effective_feedback_gains(),
+                "feedback_phase": feedback_phase,
+                "feedback_phases": feedback_phases,
+                "feedback_phase_abs_max": phase_abs_max,
+                "feedback_layer_index": (
+                    selected_indices[0]
+                    if self.config.feedback_layer_mode == "single"
+                    else None
+                ),
+                "feedback_layer_indices": selected_indices,
+                "feedback_layer_mode": self.config.feedback_layer_mode,
+                "feedback_gain_mode": self.config.feedback_gain_mode,
+                "feedback_used": (
+                    (feedback is not None or feedback_state is not None)
+                    and bool(feedback_phases)
+                ),
+                "feedback_source_kind": feedback_source_kind,
+                "feedback_state": feedback_state_for_trace,
+                "feedback_source_raw": feedback,
+            }
+        base_phases = []
+        effective_phases = []
         for layer_index, slm in enumerate(self.slm_layers):
-            field = slm(field, phase_delta=feedback_phases.get(layer_index))
-            debug[f"slm_{layer_index + 1}_field"] = field
+            phase_delta = feedback_phases.get(layer_index)
+            if return_debug:
+                base_phase = 2.0 * torch.pi * torch.sigmoid(slm.phase_logits)
+                trace_base_phase = base_phase.unsqueeze(0).expand(
+                    slot.shape[0], -1, -1
+                )
+                base_phases.append(trace_base_phase)
+                effective_phases.append(
+                    trace_base_phase
+                    if phase_delta is None
+                    else trace_base_phase + phase_delta
+                )
+            field = slm(field, phase_delta=phase_delta)
+            if return_debug:
+                debug[f"slm_{layer_index + 1}_field"] = field
             if layer_index < len(self.slm_layers) - 1:
                 field = band_limited_angular_spectrum(
                     field,
@@ -430,12 +457,19 @@ class FeedbackFSONN(nn.Module):
             self.config.wavelength_nm,
             self.config.asm_padding_factor,
         )
+        if return_debug:
+            debug["detector_field"] = field
         intensity = field.abs().square()
         output = intensity
         if self.intensity_offset is not None:
             output = output - self.intensity_offset
-        debug["intensity"] = intensity
-        debug["output"] = output
+        if return_debug:
+            debug["detector_intensity"] = intensity
+            debug["intensity"] = intensity
+            debug["detector_phase"] = torch.angle(field)
+            debug["output"] = output
+            debug["base_phases"] = torch.stack(base_phases)
+            debug["effective_phases"] = torch.stack(effective_phases)
         return output, debug
 
     def forward(
@@ -461,6 +495,7 @@ class FeedbackFSONN(nn.Module):
                 feedback_state=feedback_state,
                 feedback_layer_index=feedback_layer_index,
                 feedback_layer_indices=feedback_layer_indices,
+                return_debug=return_debug,
             )
             outputs.append(output)
             debug_slots.append(debug)

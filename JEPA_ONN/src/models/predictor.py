@@ -19,6 +19,18 @@ from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos
 from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 
 
+def _detach_trace_value(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _detach_trace_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_trace_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_trace_value(item) for item in value)
+    return value
+
+
 class VisionTransformerPredictor(nn.Module):
     """ Vision Transformer """
     def __init__(
@@ -706,6 +718,7 @@ class ONNFeedbackPredictor(nn.Module):
         masks_tgt=None,
         mask_index=0,
         num_blocks=None,
+        collect_trace=False,
     ):
         del tgt, mask_index, num_blocks
         if ctxt.ndim != 3 or ctxt.shape[-1] != self.embed_dim:
@@ -752,8 +765,11 @@ class ONNFeedbackPredictor(nn.Module):
         previous_output = None
         memory_state = None
         outputs = []
+        trace_chunks = []
         for chunk_index in range(self.num_chunks):
             x_chunk = chunks[:, chunk_index]
+            previous_output_for_trace = previous_output
+            memory_state_for_trace = memory_state
             feedback_kwargs = (
                 {"feedback_layer_index": self.feedback_layer_index}
                 if self.feedback_layer_mode == "single"
@@ -764,18 +780,33 @@ class ONNFeedbackPredictor(nn.Module):
                     x_chunk,
                     feedback=None,
                     feedback_state=memory_state,
+                    return_debug=collect_trace,
                     **feedback_kwargs,
                 )
             else:
                 result = self.onn_core(
                     x_chunk,
                     feedback=previous_output,
+                    return_debug=collect_trace,
                     **feedback_kwargs,
                 )
+            onn_debug = {}
             if isinstance(result, (tuple, list)):
-                y_chunk, feedback_source = result
+                if len(result) == 2 and isinstance(result[1], dict):
+                    y_chunk, onn_debug = result
+                    feedback_source = y_chunk
+                else:
+                    y_chunk, feedback_source = result
             else:
                 y_chunk, feedback_source = result, result
+            if collect_trace and isinstance(onn_debug, dict):
+                slot_debug = onn_debug.get("slots")
+                if (
+                    isinstance(slot_debug, (list, tuple))
+                    and len(slot_debug) == 1
+                    and isinstance(slot_debug[0], dict)
+                ):
+                    onn_debug = slot_debug[0]
             if y_chunk.shape != x_chunk.shape:
                 raise ValueError(
                     "ONN output must have shape "
@@ -799,6 +830,42 @@ class ONNFeedbackPredictor(nn.Module):
                 )
             else:
                 previous_output = feedback_source
+            if collect_trace:
+                trace_chunks.append(
+                    _detach_trace_value(
+                        {
+                            "chunk_index": chunk_index,
+                            "input_chunk": x_chunk,
+                            "input_phase": onn_debug.get("input_phase"),
+                            "input_amplitude": onn_debug.get(
+                                "input_amplitude"
+                            ),
+                            "output": y_chunk,
+                            "detector_intensity": onn_debug.get(
+                                "detector_intensity", onn_debug.get("intensity")
+                            ),
+                            "detector_field": onn_debug.get("detector_field"),
+                            "detector_phase": onn_debug.get("detector_phase"),
+                            "feedback_source_raw": previous_output_for_trace,
+                            "feedback_state": onn_debug.get("feedback_state"),
+                            "feedback_phase": onn_debug.get("feedback_phase"),
+                            "feedback_phases": onn_debug.get(
+                                "feedback_phases", {}
+                            ),
+                            "base_phases": onn_debug.get("base_phases"),
+                            "effective_phases": onn_debug.get(
+                                "effective_phases"
+                            ),
+                            "feedback_used": bool(
+                                onn_debug.get("feedback_used", False)
+                            ),
+                            "feedback_source_kind": onn_debug.get(
+                                "feedback_source_kind", "none"
+                            ),
+                            "memory_state_before": memory_state_for_trace,
+                        }
+                    )
+                )
 
         dense_output = torch.cat(outputs, dim=1)
         dense_output = self.predictor_norm(dense_output)
@@ -866,6 +933,11 @@ class ONNFeedbackPredictor(nn.Module):
             "feedback_memory_alpha": self.feedback_memory_alpha,
             "feedback_mode": self.feedback_mode,
         }
+        if collect_trace:
+            self.last_trace["chunks"] = trace_chunks
+            self.last_trace["base_phases"] = (
+                trace_chunks[0].get("base_phases") if trace_chunks else None
+            )
         return prediction
 
 
