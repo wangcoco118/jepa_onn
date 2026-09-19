@@ -159,6 +159,7 @@ class VisionTransformerPredictor(nn.Module):
                 trunc_normal_(mt, std=init_std)
         self.apply(self._init_weights)
         self._rescale_blocks()
+        self.last_trace = {}
 
     def _init_pos_embed(self, pos_embed):
         embed_dim = pos_embed.size(-1)
@@ -331,7 +332,10 @@ class VisionTransformerPredictor(nn.Module):
         return x, nodes
 
 
-    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, mask_index=1, num_blocks=None):
+    def forward(
+        self, ctxt, tgt, masks_ctxt, masks_tgt, mask_index=1, num_blocks=None,
+        collect_trace=False,
+    ):
         """
         :param ctxt: context tokens
         :param tgt: target tokens
@@ -386,6 +390,25 @@ class VisionTransformerPredictor(nn.Module):
         masks_ctxt = torch.cat(masks_ctxt, dim=0)
         masks_tgt = torch.cat(masks_tgt, dim=0)
         masks = torch.cat([masks_ctxt, masks_tgt], dim=1)
+        dense_input = None
+        if collect_trace:
+            dense_input = torch.zeros(
+                x.shape[0],
+                self.num_patches,
+                D,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            dense_input.scatter_(
+                1,
+                masks_ctxt.unsqueeze(-1).expand(-1, -1, D),
+                x[:, :N_ctxt],
+            )
+            dense_input.scatter_(
+                1,
+                masks_tgt.unsqueeze(-1).expand(-1, -1, D),
+                x[:, N_ctxt:],
+            )
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):
@@ -394,6 +417,27 @@ class VisionTransformerPredictor(nn.Module):
             if (num_blocks is not None and i >= num_blocks - 1):
                 break
         x = self.predictor_norm(x)
+        if collect_trace:
+            dense_output_after_norm = torch.zeros_like(dense_input)
+            dense_output_after_norm.scatter_(
+                1,
+                masks_ctxt.unsqueeze(-1).expand(-1, -1, D),
+                x[:, :N_ctxt],
+            )
+            dense_output_after_norm.scatter_(
+                1,
+                masks_tgt.unsqueeze(-1).expand(-1, -1, D),
+                x[:, N_ctxt:],
+            )
+            self.last_trace = {
+                "predictor_type": "vit_transformer",
+                "dense_input": _detach_trace_value(dense_input),
+                "dense_output_after_norm": _detach_trace_value(
+                    dense_output_after_norm
+                ),
+                "masks_ctxt": _detach_trace_value(masks_ctxt),
+                "masks_tgt": _detach_trace_value(masks_tgt),
+            }
 
         # Return output corresponding to target tokens
         x = x[:, N_ctxt:]
@@ -938,6 +982,9 @@ class ONNFeedbackPredictor(nn.Module):
             self.last_trace["base_phases"] = (
                 trace_chunks[0].get("base_phases") if trace_chunks else None
             )
+            self.last_trace["dense_input"] = _detach_trace_value(dense_input)
+            self.last_trace["masks_ctxt"] = _detach_trace_value(masks_ctxt)
+            self.last_trace["masks_tgt"] = _detach_trace_value(masks_tgt)
         return prediction
 
 

@@ -1,22 +1,60 @@
-torch>=2
-torchvision
-tensorboard
-iopath
-pyyaml
-numpy
-opencv-python
-submitit
-braceexpand
-webdataset
-timm
-transformers
-peft
-pandas
-einops
-beartype
-psutil
-h5py
-fire
-python-box
-scikit-image
-ftfy
+ssh 172.27.22.8
+密码：4wMMgDf+lgnrp.18g
+
+ssh 172.27.130.229
+2%+pnbP8xP!K
+
+SSH地址:175.155.64.171,端口:24069
+用户名:linux
+密码:Dv#9k
+登录命令:ssh-p 24069linux@175.155.64.171
+
+
+ssh -p 22120 -N -L 12049:127.0.0.1:2049 linux@61.157.218.59
+
+ssh -p 22120 linux@61.157.218.59
+V6@jm
+conda activate semseg
+cd /home/linux/wkx/project2_SemSeg
+
+
+git config --global user.name "wkx"
+git config --global user.email "1957476964@qq.com"
+
+目前环境已经配置好，进入开发机后：
+source /mnt/project_modelware/zhaojian/miniconda3/bin/activate
+conda activate /mnt/project_modelware/zhaojian/miniconda3/envs/sfas
+cd /mnt/project_modelware/zhaojian/zhou_lu_wang/wkx/project2_SemSeg
+
+
+python main.py --gpu-ids 3
+
+
+python overfit_check.py --gpu-ids 1
+
+watch -n 1 nvidia-smi
+
+mkdir -p /data/linux/wkx/tmp_semseg
+export TMPDIR=/data/linux/wkx/tmp_semseg
+
+
+watch -n 5 nvidia-smi
+
+nvidia-smi
+
+tmux new -s d2nn
+
+tmux attach -t d2nn
+
+git restore --staged .
+git add *.py model/*.py
+git status
+git commit -m "update code"
+
+git push
+
+git status
+git add -- "*.py"
+
+python3 sweep_val_post4f_aperture.py --split-seed 42
+python3 sweep_val_post4fNoL1_layers_then_distances.py --split-seed 42

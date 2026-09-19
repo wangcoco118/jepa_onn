@@ -28,7 +28,7 @@ from evals.intuitive_physics.train_optical import (
 )
 
 
-FULL_MODES = {"onn_feedback", "end_to_end_jepa"}
+FULL_MODES = {"onn_feedback", "end_to_end_jepa", "electronic_control"}
 
 
 def _jsonable(value):
@@ -141,7 +141,7 @@ def _active_indices(onn_config):
     return [int(index) for index in indices]
 
 
-def _checkpoint_config(checkpoint):
+def _checkpoint_config(checkpoint, predictor_type="auto"):
     mode = checkpoint.get("mode")
     if mode not in FULL_MODES:
         raise ValueError(
@@ -153,12 +153,15 @@ def _checkpoint_config(checkpoint):
     config = copy.deepcopy(checkpoint["config"])
     if not isinstance(config, dict):
         raise ValueError("checkpoint config must be a mapping")
-    if "onn" not in config:
+    resolved_predictor_type = _resolve_predictor_type(
+        checkpoint, config, predictor_type
+    )
+    if resolved_predictor_type == "onn_feedback" and "onn" not in config:
         saved_onn = checkpoint.get("onn") or checkpoint.get("onn_feedback")
         if not saved_onn:
-            raise ValueError("checkpoint has no ONN configuration")
+            raise ValueError("ONN checkpoint has no ONN configuration")
         config["onn"] = copy.deepcopy(saved_onn)
-    config["predictor_type"] = "onn_feedback"
+    config["predictor_type"] = resolved_predictor_type
     predictor_config = dict(config.get("predictor") or {})
     if "output_mode" not in predictor_config or predictor_config["output_mode"] is None:
         keys = checkpoint["predictor"].keys()
@@ -209,6 +212,182 @@ def _plot_chunk_grid(output_dir, values, filename, title, colorbar_label,
     )
     figure.savefig(output_dir / filename, dpi=180, bbox_inches="tight")
     plt.close(figure)
+
+
+def _sample_batch_tensor(value):
+    array = _to_numpy(value)
+    if array is None:
+        return None
+    if array.ndim == 2 and array.shape[0] == 1:
+        return array[0]
+    return array
+
+
+def _feature_limit(*values, percentile=99.0):
+    finite = np.concatenate([
+        np.asarray(value)[np.isfinite(value)].ravel()
+        for value in values
+        if value is not None
+    ])
+    if finite.size == 0:
+        return 1.0
+    return max(float(np.percentile(np.abs(finite), percentile)), 1.0e-6)
+
+
+def _plot_feature_matrix(
+    output_dir, features, filename, title, vmin, vmax
+):
+    if features.shape != (1568, 384):
+        raise ValueError(
+            f"feature matrix must have shape (1568, 384), got {features.shape}"
+        )
+    figure, axis = plt.subplots(figsize=(13.5, 9.0))
+    image = axis.imshow(
+        features,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="RdBu_r",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    for boundary in range(196, 1568, 196):
+        axis.axhline(boundary - 0.5, color="black", linewidth=0.7, alpha=0.8)
+    centers = np.arange(98, 1568, 196)
+    axis.set_yticks(centers)
+    axis.set_yticklabels([f"t={index}" for index in range(8)])
+    axis.set_xlabel("feature dimension")
+    axis.set_ylabel("chunk")
+    axis.set_title(title)
+    figure.colorbar(image, ax=axis, label="feature value", shrink=0.86)
+    figure.savefig(output_dir / filename, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _save_feature_trace(output_dir, predictor_type, predictor_trace):
+    input_features = _sample_tensor(predictor_trace.get("dense_input"))
+    if input_features is None:
+        raise RuntimeError("predictor trace did not contain dense_input")
+    if input_features.shape != (1568, 384):
+        raise ValueError(
+            f"dense_input must have shape (1568, 384), got {input_features.shape}"
+        )
+
+    transformer_features = None
+    if predictor_type == "vit_transformer":
+        transformer_features = _sample_tensor(
+            predictor_trace.get("dense_output_after_norm")
+        )
+        if transformer_features is None:
+            raise RuntimeError(
+                "Transformer trace did not contain dense_output_after_norm"
+            )
+        if transformer_features.shape != input_features.shape:
+            raise ValueError(
+                "Transformer output and input feature shapes do not match: "
+                f"{transformer_features.shape} vs {input_features.shape}"
+            )
+
+    feature_limit = _feature_limit(
+        input_features,
+        transformer_features,
+    )
+    files = ["figure_F_input_1568x384.png"]
+    _plot_feature_matrix(
+        output_dir,
+        input_features,
+        files[0],
+        "Encoder-compressed dense predictor input: [1568,384]",
+        -feature_limit,
+        feature_limit,
+    )
+
+    arrays = {
+        "F_input": input_features.astype(np.float32),
+        "masks_ctxt": _sample_batch_tensor(
+            predictor_trace.get("masks_ctxt")
+        ),
+        "masks_tgt": _sample_batch_tensor(
+            predictor_trace.get("masks_tgt")
+        ),
+        "chunk_index": np.repeat(np.arange(8), 196),
+    }
+    info = {
+        "feature_visualization_files": files,
+        "feature_input_shape": list(arrays["F_input"].shape),
+        "feature_output_shape": None,
+        "predictor_dim": 384,
+        "has_transformer_output": False,
+        "has_difference_plot": False,
+        "color_scale_input_output": {
+            "vmin": -feature_limit,
+            "vmax": feature_limit,
+        },
+        "color_scale_difference": None,
+    }
+
+    if transformer_features is not None:
+        difference = transformer_features - input_features
+        output_file = "figure_F_transformer_output_1568x384.png"
+        difference_file = "figure_F_feature_difference_1568x384.png"
+        _plot_feature_matrix(
+            output_dir,
+            transformer_features,
+            output_file,
+            "Transformer predictor output before 1024 projection: [1568,384]",
+            -feature_limit,
+            feature_limit,
+        )
+        difference_limit = _feature_limit(difference)
+        _plot_feature_matrix(
+            output_dir,
+            difference,
+            difference_file,
+            "Transformer output - input: [1568,384]",
+            -difference_limit,
+            difference_limit,
+        )
+        files.extend([output_file, difference_file])
+        arrays["F_transformer"] = transformer_features.astype(np.float32)
+        arrays["F_difference"] = difference.astype(np.float32)
+        info.update({
+            "feature_output_shape": list(transformer_features.shape),
+            "has_transformer_output": True,
+            "has_difference_plot": True,
+            "color_scale_difference": {
+                "vmin": -difference_limit,
+                "vmax": difference_limit,
+            },
+        })
+
+    np.savez(output_dir / "feature_trace.npz", **arrays)
+    info["feature_trace_file"] = "feature_trace.npz"
+    info["context_token_count"] = (
+        int(arrays["masks_ctxt"].size)
+        if arrays["masks_ctxt"] is not None else None
+    )
+    info["target_token_count"] = (
+        int(arrays["masks_tgt"].size)
+        if arrays["masks_tgt"] is not None else None
+    )
+    return info
+
+
+def _resolve_predictor_type(checkpoint, config, requested):
+    if requested == "onn":
+        return "onn_feedback"
+    if requested == "transformer":
+        return "vit_transformer"
+
+    candidates = [
+        config.get("predictor_type"),
+        checkpoint.get("predictor_type"),
+        (config.get("training") or {}).get("experiment_mode"),
+    ]
+    if any(str(value) in {"onn", "onn_feedback"} for value in candidates):
+        return "onn_feedback"
+    if "onn" in config or "onn_feedback" in checkpoint:
+        return "onn_feedback"
+    return "vit_transformer"
 
 
 def _plot_input_phase(output_dir, input_phases):
@@ -838,6 +1017,11 @@ def main():
         help="training-result directory that will contain visualizations",
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--predictor-type",
+        choices=["auto", "transformer", "onn"],
+        default="auto",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -848,7 +1032,7 @@ def main():
     checkpoint = torch.load(
         checkpoint_path, map_location="cpu", weights_only=False
     )
-    config = _checkpoint_config(checkpoint)
+    config = _checkpoint_config(checkpoint, args.predictor_type)
     video_id, resolved_index = _select_video_id(
         checkpoint, args.sample_index, args.video_id
     )
@@ -886,10 +1070,14 @@ def main():
             "direct_384_loss", False
         ),
         pred_depth=runtime_config["pretrain"].get("pred_depth", 12),
-        optical_qkv=runtime_config.get("optical_qkv", {}),
+        optical_qkv=(
+            runtime_config.get("optical_qkv", {})
+            if runtime_config["predictor_type"] == "onn_feedback"
+            else {}
+        ),
         predictor_checkpoint=str(checkpoint_path),
-        predictor_type="onn_feedback",
-        onn_feedback_config=runtime_config["onn"],
+        predictor_type=runtime_config["predictor_type"],
+        onn_feedback_config=runtime_config.get("onn"),
     )
     encoder.eval()
     target_encoder.eval()
@@ -909,11 +1097,7 @@ def main():
         )
         predictor(context, targets, masks_ctxt, masks_tgt, collect_trace=True)
     predictor_core = predictor.backbone
-    traces = predictor_core.last_trace.get("chunks")
-    if not traces or len(traces) != 8:
-        raise RuntimeError("expected 8 chunk trace records")
-    onn_config = runtime_config["onn"]
-    active_indices = _active_indices(onn_config)
+    predictor_type = runtime_config["predictor_type"]
     output_root = Path(args.output_root) if args.output_root else _default_output_root(
         checkpoint_path
     )
@@ -921,6 +1105,36 @@ def main():
     sample_id = f"sample_{resolved_index:04d}_{video_id}"
     output_dir = output_root / "visualizations" / sample_id
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    feature_info = _save_feature_trace(
+        output_dir, predictor_type, predictor_core.last_trace
+    )
+    if predictor_type == "vit_transformer":
+        metadata = {
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_mode": checkpoint.get("mode"),
+            "predictor_type": predictor_type,
+            "sample_index": resolved_index,
+            "video_id": video_id,
+            "sample_id": sample_id,
+            "frame_indices": None,
+            "num_chunks": 8,
+            "chunk_tokens": 196,
+            "config": _jsonable(config),
+        }
+        metadata.update(feature_info)
+        (output_dir / "visualization_metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False)
+        )
+        print(output_dir)
+        return
+
+    traces = predictor_core.last_trace.get("chunks")
+    if not traces or len(traces) != 8:
+        raise RuntimeError("expected 8 chunk trace records")
+    onn_config = runtime_config["onn"]
+    active_indices = _active_indices(onn_config)
     arrays = _save_trace(output_dir, traces, active_indices)
     _plot_base(output_dir, arrays["base_phases"])
     _plot_base_contrast(output_dir, arrays["base_phases"])
@@ -1025,7 +1239,9 @@ def main():
 
     metadata = {
         "checkpoint": str(checkpoint_path),
+        "checkpoint_path": str(checkpoint_path),
         "checkpoint_mode": checkpoint.get("mode"),
+        "predictor_type": predictor_type,
         "sample_index": resolved_index,
         "video_id": video_id,
         "sample_id": sample_id,
@@ -1114,6 +1330,7 @@ def main():
             )[1] if arrays["state_valid"].any() else 1.0,
         },
     }
+    metadata.update(feature_info)
     (output_dir / "visualization_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False)
     )
