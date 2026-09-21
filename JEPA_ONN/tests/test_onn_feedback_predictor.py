@@ -35,6 +35,7 @@ class RecordingONN(nn.Module):
         feedback_state=None,
         feedback_layer_index=None,
         feedback_layer_indices=None,
+        return_debug=False,
     ):
         if feedback is not None and feedback_state is not None:
             raise ValueError("feedback and feedback_state are mutually exclusive")
@@ -55,6 +56,8 @@ class RecordingONN(nn.Module):
         elif feedback_state is not None:
             output = output + 0.1 * feedback_state
         self.outputs.append(output)
+        if return_debug:
+            return output, {}
         return output, output
 
 
@@ -64,7 +67,7 @@ class LegacyRecordingONN(nn.Module):
         self.projection = nn.Linear(dim, dim)
         self.slm_layers = nn.ModuleList([nn.Identity() for _ in range(4)])
 
-    def forward(self, x, feedback=None, feedback_layer_index=None):
+    def forward(self, x, feedback=None, feedback_layer_index=None, return_debug=False):
         output = self.projection(x)
         if feedback is not None:
             output = output + 0.1 * (
@@ -157,6 +160,40 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
 
                 self.assertEqual(tuple(output.shape), (1, 1560, 1024))
                 self.assertEqual(predictor.last_trace["output_mode"], output_mode)
+
+    def test_optical_output_mode_maps_only_target_tokens_after_feedback(self):
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            output_mode="optical",
+            optical_output_config={},
+            onn_core=RecordingONN(384),
+        )
+        context = torch.randn(1, 1, 1024)
+        masks_ctxt = torch.tensor([[0]], dtype=torch.long)
+        masks_tgt = torch.tensor([[1567, 1000]], dtype=torch.long)
+
+        output = predictor(
+            context,
+            None,
+            masks_ctxt,
+            masks_tgt,
+            collect_trace=True,
+        )
+
+        self.assertEqual(tuple(output.shape), (1, 2, 1024))
+        self.assertEqual(predictor.last_trace["pred_tgt_384_shape"], (1, 2, 384))
+        self.assertEqual(predictor.last_trace["prediction_shape"], (1, 2, 1024))
+        self.assertEqual(predictor.last_trace["output_mode"], "optical")
+        self.assertIn("optical_output", predictor.last_trace)
+        self.assertEqual(
+            tuple(predictor.last_trace["optical_output"].shape),
+            (1, 2, 1024),
+        )
+        self.assertEqual(len(predictor.optical_output_mapper.slm_layers), 2)
 
     def test_direct_384_loss_returns_raw_384_prediction(self):
         predictor = ONNFeedbackPredictor(
@@ -487,6 +524,23 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
             torch.allclose(actual[2], model._feedback_to_phases(state)[2])
         )
 
+    def test_feedback_sign_negates_feedback_phase(self):
+        state = torch.tensor([[[2.0, -1.0], [0.5, 3.0]]])
+        positive_model = FeedbackFSONN(
+            small_onn_config(feedback_sign=1.0)
+        )
+        negative_model = FeedbackFSONN(
+            small_onn_config(feedback_sign=-1.0)
+        )
+        negative_model.feedback_gain_raw.data.copy_(
+            positive_model.feedback_gain_raw.data
+        )
+
+        positive_phase = positive_model._feedback_state_to_phases(state)[2]
+        negative_phase = negative_model._feedback_state_to_phases(state)[2]
+
+        self.assertTrue(torch.equal(negative_phase, -positive_phase))
+
     def test_memory_feedback_preserves_cross_chunk_gradients_and_slm_parameters(self):
         torch.manual_seed(31)
         config = small_onn_config(
@@ -567,6 +621,80 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
         self.assertNotIn("predictor_pos_embed", dict(predictor.named_parameters()))
         self.assertIn("predictor_pos_embed", dict(predictor.named_buffers()))
         self.assertEqual(predictor.feedback_layer_index, 2)
+
+    def test_learnable_offset_readout_subtracts_parameter(self):
+        model = FeedbackFSONN(
+            small_onn_config(
+                readout_mode="learnable_offset",
+                learnable_intensity_offset=True,
+            )
+        )
+        with torch.no_grad():
+            model.intensity_offset.copy_(
+                torch.tensor([[[0.25, -0.5]]])
+            )
+        slot = torch.tensor([[[0.2, -0.3], [0.4, -0.1]]])
+
+        output, debug = model._propagate_slot(slot, return_debug=True)
+
+        self.assertTrue(
+            torch.allclose(
+                output,
+                debug["intensity"] - model.intensity_offset,
+            )
+        )
+        self.assertTrue(torch.equal(debug["output"], output))
+
+    def test_output_mean_readout_centers_each_token_without_parameter(self):
+        model = FeedbackFSONN(
+            small_onn_config(
+                readout_mode="output_mean",
+                learnable_intensity_offset=True,
+            )
+        )
+        slot = torch.tensor([[[0.2, -0.3], [0.4, -0.1]]])
+
+        output, debug = model._propagate_slot(slot, return_debug=True)
+        expected_mean = debug["intensity"].mean(dim=-1, keepdim=True)
+
+        self.assertIsNone(model.intensity_offset)
+        self.assertTrue(
+            torch.allclose(
+                output,
+                debug["intensity"] - expected_mean,
+            )
+        )
+        self.assertTrue(torch.equal(debug["output_mean"], expected_mean))
+        self.assertTrue(
+            torch.allclose(
+                output.mean(dim=-1),
+                torch.zeros_like(output[..., 0]),
+                atol=1e-6,
+            )
+        )
+
+    def test_readout_mode_legacy_alias_and_invalid_value(self):
+        legacy = small_onn_config(
+            readout_mode="intensity_minus_learnable_offset"
+        )
+
+        self.assertEqual(legacy.readout_mode, "learnable_offset")
+        with self.assertRaisesRegex(ValueError, "unsupported readout_mode"):
+            small_onn_config(readout_mode="global_mean")
+
+    def test_predictor_preserves_output_mean_readout_config(self):
+        predictor = ONNFeedbackPredictor(
+            optical_config={
+                "readout_mode": "output_mean",
+                "learnable_intensity_offset": False,
+            }
+        )
+
+        self.assertEqual(predictor.onn_core.config.readout_mode, "output_mean")
+        self.assertFalse(
+            predictor.onn_core.config.learnable_intensity_offset
+        )
+        self.assertIsNone(predictor.onn_core.intensity_offset)
 
     def test_feedback_onn_has_single_intensity_readout(self):
         config = ONNConfig.from_mapping(
@@ -711,6 +839,8 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
             ("feedback_phase_max_rad", -1.0),
             ("feedback_gain_init", 0.0),
             ("feedback_gain_init", -1.0),
+            ("feedback_sign", 0.0),
+            ("feedback_sign", 2.0),
         ):
             with self.subTest(key=key, value=value):
                 with self.assertRaises(ValueError):

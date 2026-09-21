@@ -1066,6 +1066,9 @@ def main():
         ),
         pred_embed_dim=runtime_config["predictor"].get("predictor_dim", 384),
         output_mode=runtime_config["predictor"].get("output_mode", "mlp"),
+        optical_output_config=runtime_config["predictor"].get(
+            "optical_output"
+        ),
         direct_384_loss=runtime_config["predictor"].get(
             "direct_384_loss", False
         ),
@@ -1261,7 +1264,12 @@ def main():
             onn_config["feedback_phase_max_rad"]
         ),
         "phase_display_range": [-math.pi, math.pi],
-        "output_definition": "intensity_minus_learnable_offset",
+        "output_definition": (
+            "learnable_offset"
+            if onn_config.get("readout_mode")
+            == "intensity_minus_learnable_offset"
+            else onn_config.get("readout_mode", "learnable_offset")
+        ),
         "detector_intensity_definition": "|detector_field|^2",
         "detector_phase_definition": "angle(detector_field)",
         "effective_phase_definition": "base_phase_plus_feedback_delta",

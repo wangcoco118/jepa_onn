@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from src.masks.utils import apply_masks
 from src.models.utils.modules import Block
 from src.models.fsonn import FeedbackFSONN, ONNConfig, OpticalQKVConfig, TimeDivisionFSONN
+from src.models.optical_output import OpticalOutputMapper
 from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 
@@ -462,6 +463,7 @@ class ONNFeedbackPredictor(nn.Module):
         chunk_tokens=196,
         output_mlp_hidden_dim=384,
         output_mode="mlp",
+        optical_output_config=None,
         direct_384_loss=False,
         feedback_mode="fixed_middle_phase",
         feedback_layer_mode=None,
@@ -494,14 +496,20 @@ class ONNFeedbackPredictor(nn.Module):
             "mlp",
             "linear",
             "interpolate",
+            "optical",
         }:
             raise ValueError(
-                "output_mode must be one of: 'mlp', 'linear', 'interpolate'"
+                "output_mode must be one of: "
+                "'mlp', 'linear', 'interpolate', 'optical'"
             )
         self.output_mode = output_mode
         if not isinstance(direct_384_loss, bool):
             raise TypeError("direct_384_loss must be a boolean")
         self.direct_384_loss = direct_384_loss
+        if self.output_mode == "optical" and self.direct_384_loss:
+            raise ValueError(
+                "output_mode='optical' requires direct_384_loss=False"
+            )
 
         self.predictor_embed = nn.Linear(
             self.embed_dim, self.predictor_embed_dim, bias=True
@@ -537,6 +545,10 @@ class ONNFeedbackPredictor(nn.Module):
             self.output_linear = nn.Linear(
                 self.predictor_embed_dim, self.embed_dim
             )
+        elif self.output_mode == "optical":
+            self.optical_output_mapper = OpticalOutputMapper(
+                optical_output_config
+            )
 
         if onn_core is None:
             config_values = dict(optical_config or {})
@@ -547,7 +559,6 @@ class ONNFeedbackPredictor(nn.Module):
                     "output_dim": self.predictor_embed_dim,
                     "grid_height": self.chunk_tokens,
                     "grid_width": self.predictor_embed_dim,
-                    "learnable_intensity_offset": True,
                 }
             )
             if feedback_layer_mode is not None:
@@ -919,6 +930,7 @@ class ONNFeedbackPredictor(nn.Module):
             masks_tgt.unsqueeze(-1).expand(-1, -1, self.predictor_embed_dim),
         )
         pred_tgt_1024 = None
+        optical_debug = None
         if self.direct_384_loss:
             prediction = pred_tgt_384
         elif self.output_mode == "mlp":
@@ -926,6 +938,16 @@ class ONNFeedbackPredictor(nn.Module):
             prediction = pred_tgt_1024
         elif self.output_mode == "linear":
             pred_tgt_1024 = self.output_linear(pred_tgt_384)
+            prediction = pred_tgt_1024
+        elif self.output_mode == "optical":
+            optical_result = self.optical_output_mapper(
+                pred_tgt_384,
+                return_debug=collect_trace,
+            )
+            if collect_trace:
+                pred_tgt_1024, optical_debug = optical_result
+            else:
+                pred_tgt_1024 = optical_result
             prediction = pred_tgt_1024
         else:
             batch_size, num_target_tokens, input_dim = pred_tgt_384.shape
@@ -985,6 +1007,10 @@ class ONNFeedbackPredictor(nn.Module):
             self.last_trace["dense_input"] = _detach_trace_value(dense_input)
             self.last_trace["masks_ctxt"] = _detach_trace_value(masks_ctxt)
             self.last_trace["masks_tgt"] = _detach_trace_value(masks_tgt)
+            if optical_debug is not None:
+                self.last_trace.update(
+                    _detach_trace_value(optical_debug)
+                )
         return prediction
 
 

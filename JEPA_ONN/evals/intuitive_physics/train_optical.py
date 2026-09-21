@@ -107,6 +107,8 @@ def _feedback_runtime_metadata(predictor):
         "feedback_mode": config.feedback_mode,
         "feedback_layer_mode": config.feedback_layer_mode,
         "feedback_phase_max_rad": float(config.feedback_phase_max_rad),
+        "feedback_sign": float(config.feedback_sign),
+        "readout_mode": config.readout_mode,
         "feedback_gain_epsilon": float(config.feedback_gain_epsilon),
         "feedback_memory_enabled": bool(config.feedback_memory_enabled),
         "feedback_memory_alpha": float(config.feedback_memory_alpha),
@@ -126,6 +128,33 @@ def _feedback_runtime_metadata(predictor):
     else:
         metadata["feedback_layer_indices"] = layer_indices
         metadata["feedback_gain_mode"] = config.feedback_gain_mode
+
+    output_mode = getattr(predictor_model, "output_mode", None)
+    if output_mode is not None:
+        metadata["output_mode"] = output_mode
+    optical_mapper = getattr(predictor_model, "optical_output_mapper", None)
+    if output_mode == "optical" and optical_mapper is not None:
+        optical_config = optical_mapper.config
+        metadata.update(
+            {
+                "target_only": True,
+                "optical_num_slm_layers": int(
+                    optical_config.num_slm_layers
+                ),
+                "optical_grid_size": int(optical_config.grid_size),
+                "optical_wavelength_nm": float(
+                    optical_config.wavelength_nm
+                ),
+                "optical_pixel_size_um": float(
+                    optical_config.pixel_size_um
+                ),
+                "optical_distances_um": [
+                    float(distance)
+                    for distance in optical_config.all_distances_um
+                ],
+                "optical_output_centering": "per_token_mean",
+            }
+        )
     return metadata
 
 
@@ -150,6 +179,8 @@ def _format_feedback_metadata(metadata):
         [
             f"physical_feedback_layers={metadata['physical_feedback_layers']}",
             f"feedback_phase_max_rad={metadata['feedback_phase_max_rad']:.12g}",
+            f"feedback_sign={metadata['feedback_sign']:.12g}",
+            f"readout_mode={metadata['readout_mode']}",
             f"feedback_gain_parameter_count={metadata['feedback_gain_parameter_count']}",
             "feedback_memory_enabled="
             f"{str(metadata['feedback_memory_enabled']).lower()}",
@@ -162,6 +193,28 @@ def _format_feedback_metadata(metadata):
     parts.append(
         f"feedback_memory_update={metadata['feedback_memory_update']}"
     )
+    if metadata.get("output_mode") == "optical":
+        parts.extend(
+            [
+                "output_mode=optical",
+                f"target_only={metadata['target_only']}",
+                f"optical_num_slm_layers={metadata['optical_num_slm_layers']}",
+                f"optical_grid_size={metadata['optical_grid_size']}",
+                (
+                    "optical_wavelength_nm="
+                    f"{metadata['optical_wavelength_nm']:g}"
+                ),
+                (
+                    "optical_pixel_size_um="
+                    f"{metadata['optical_pixel_size_um']:g}"
+                ),
+                f"optical_distances_um={metadata['optical_distances_um']}",
+                (
+                    "optical_output_centering="
+                    f"{metadata['optical_output_centering']}"
+                ),
+            ]
+        )
     gains = metadata["effective_feedback_gains"]
     if len(gains) == 1:
         gains = gains * len(metadata["physical_feedback_layers"])
@@ -1067,6 +1120,9 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
         optical_qkv={} if predictor_type == "onn_feedback" else optical_cfg,
         predictor_type=predictor_type,
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
+        optical_output_config=args_eval.get("predictor", {}).get(
+            "optical_output"
+        ),
         direct_384_loss=args_eval.get("predictor", {}).get(
             "direct_384_loss", False
         ),
@@ -1280,7 +1336,7 @@ def _end_to_end_checkpoint(
         "chunk_tokens": 196,
         "predictor_dim": 384,
         "output_dim": 1024,
-        "readout_mode": "intensity_minus_learnable_offset",
+        "readout_mode": "learnable_offset",
         "differential_detector": False,
         "world_size": int(world_size),
         "gpu_ids": list(gpu_ids or []),

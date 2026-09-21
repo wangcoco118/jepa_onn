@@ -28,11 +28,12 @@ class ONNConfig:
     feedback_layer_indices: Optional[Tuple[int, ...]] = None
     feedback_gain_mode: Optional[str] = None
     feedback_phase_max_rad: float = 1.5707963267948966
+    feedback_sign: float = 1.0
     feedback_gain_init: Union[float, Tuple[float, ...]] = 1.0
     feedback_gain_epsilon: float = 1.0e-6
     feedback_memory_enabled: bool = False
     feedback_memory_alpha: float = 0.8
-    readout_mode: str = "intensity_minus_learnable_offset"
+    readout_mode: str = "learnable_offset"
     input_encoding_mode: str = "signed_phase"
     pixel_pitch_um: float = 8.0
     wavelength_nm: float = 532.0
@@ -113,6 +114,11 @@ class ONNConfig:
             raise ValueError("only feedback_mode='fixed_middle_phase' is supported")
         if self.feedback_phase_max_rad <= 0:
             raise ValueError("feedback_phase_max_rad must be positive")
+        if type(self.feedback_sign) is not float or self.feedback_sign not in {
+            1.0,
+            -1.0,
+        }:
+            raise ValueError("feedback_sign must be 1.0 or -1.0")
         if self.feedback_gain_epsilon <= 0:
             raise ValueError("feedback_gain_epsilon must be positive")
         if not 0.0 <= float(self.feedback_memory_alpha) < 1.0:
@@ -121,8 +127,12 @@ class ONNConfig:
             raise ValueError(
                 "feedback_memory_enabled cannot be true when feedback is disabled"
             )
-        if self.readout_mode != "intensity_minus_learnable_offset":
-            raise ValueError("only intensity_minus_learnable_offset is supported")
+        if self.readout_mode == "intensity_minus_learnable_offset":
+            object.__setattr__(self, "readout_mode", "learnable_offset")
+        if self.readout_mode not in {"learnable_offset", "output_mean"}:
+            raise ValueError(
+                f"unsupported readout_mode: {self.readout_mode}"
+            )
         if self.input_encoding_mode != "signed_phase":
             raise ValueError("only signed_phase input encoding is supported")
 
@@ -247,7 +257,10 @@ class FeedbackFSONN(nn.Module):
         self.feedback_gain_raw = nn.Parameter(feedback_gain_raw)
         self.intensity_offset = (
             nn.Parameter(torch.zeros(1, 1, config.output_dim))
-            if config.learnable_intensity_offset
+            if (
+                config.readout_mode == "learnable_offset"
+                and config.learnable_intensity_offset
+            )
             else None
         )
 
@@ -269,13 +282,17 @@ class FeedbackFSONN(nn.Module):
         gains = self._effective_feedback_gains()
         indices = self.config.active_feedback_layer_indices
         if self.config.feedback_layer_mode == "single" or self.config.feedback_gain_mode == "shared":
-            shared_phase = self.config.feedback_phase_max_rad * torch.tanh(
-                gains * feedback_state
+            shared_phase = (
+                self.config.feedback_sign
+                * self.config.feedback_phase_max_rad
+                * torch.tanh(gains * feedback_state)
             )
             return {index: shared_phase for index in indices}
         return {
-            index: self.config.feedback_phase_max_rad * torch.tanh(
-                gains[position] * feedback_state
+            index: (
+                self.config.feedback_sign
+                * self.config.feedback_phase_max_rad
+                * torch.tanh(gains[position] * feedback_state)
             )
             for position, index in enumerate(indices)
         }
@@ -460,14 +477,26 @@ class FeedbackFSONN(nn.Module):
         if return_debug:
             debug["detector_field"] = field
         intensity = field.abs().square()
-        output = intensity
-        if self.intensity_offset is not None:
-            output = output - self.intensity_offset
+
+        if self.config.readout_mode == "learnable_offset":
+            output = intensity
+            if self.intensity_offset is not None:
+                output = output - self.intensity_offset
+        elif self.config.readout_mode == "output_mean":
+            output_mean = intensity.mean(dim=-1, keepdim=True)
+            output = intensity - output_mean
+        else:
+            raise ValueError(
+                f"unsupported readout_mode: {self.config.readout_mode}"
+            )
+
         if return_debug:
             debug["detector_intensity"] = intensity
             debug["intensity"] = intensity
             debug["detector_phase"] = torch.angle(field)
             debug["output"] = output
+            if self.config.readout_mode == "output_mean":
+                debug["output_mean"] = output_mean
             debug["base_phases"] = torch.stack(base_phases)
             debug["effective_phases"] = torch.stack(effective_phases)
         return output, debug

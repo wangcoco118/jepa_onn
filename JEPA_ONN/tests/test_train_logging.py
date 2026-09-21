@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from evals.intuitive_physics import train_optical
 from src.models.fsonn import FeedbackFSONN, ONNConfig
+from src.models.optical_output import OpticalOutputMapper
 from evals.intuitive_physics.train_optical import (
     _configure_logging,
     _format_jepa_batch_log,
@@ -73,6 +74,51 @@ class TrainLoggingTests(unittest.TestCase):
             self.assertNotIn(repeated_field, message)
 
 
+    def test_optical_output_metadata_is_logged_separately_from_feedback(self):
+        config = ONNConfig.from_mapping(
+            {
+                "input_dim": 2,
+                "output_dim": 2,
+                "num_slm_layers": 4,
+                "chunk_tokens": 2,
+                "grid_height": 2,
+                "grid_width": 2,
+                "feedback_layer_index": 2,
+                "slm_intervals_um": [8.0, 8.0, 8.0],
+                "input_to_first_slm_um": 8.0,
+                "last_slm_to_detector_um": 8.0,
+                "asm_padding_factor": 1.0,
+            }
+        )
+
+        class PredictorStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.onn_core = FeedbackFSONN(config)
+                self.output_mode = "optical"
+                self.optical_output_mapper = OpticalOutputMapper()
+
+        metadata = train_optical._feedback_runtime_metadata(PredictorStub())
+
+        self.assertEqual(metadata["output_mode"], "optical")
+        self.assertTrue(metadata["target_only"])
+        self.assertEqual(metadata["optical_num_slm_layers"], 2)
+        self.assertEqual(metadata["optical_grid_size"], 32)
+        self.assertEqual(metadata["optical_wavelength_nm"], 532.0)
+        self.assertEqual(metadata["optical_pixel_size_um"], 8.0)
+        self.assertEqual(
+            metadata["optical_distances_um"],
+            [8000.0, 8000.0, 8000.0],
+        )
+        self.assertEqual(
+            metadata["optical_output_centering"],
+            "per_token_mean",
+        )
+        message = train_optical._format_feedback_metadata(metadata)
+        self.assertIn("output_mode=optical", message)
+        self.assertIn("target_only=True", message)
+        self.assertIn("optical_distances_um=[8000.0, 8000.0, 8000.0]", message)
+
     def test_feedback_metadata_and_checkpoint_use_resolved_independent_model(self):
         self.assertTrue(hasattr(train_optical, "_feedback_runtime_metadata"))
         config = ONNConfig.from_mapping(
@@ -88,6 +134,9 @@ class TrainLoggingTests(unittest.TestCase):
                 "feedback_gain_mode": "independent",
                 "feedback_gain_init": [0.5, 1.5, 3.0],
                 "feedback_phase_max_rad": 0.75,
+                "feedback_sign": -1.0,
+                "readout_mode": "output_mean",
+                "learnable_intensity_offset": False,
                 "feedback_memory_enabled": True,
                 "feedback_memory_alpha": 0.8,
                 "slm_intervals_um": [8.0, 8.0, 8.0, 8.0],
@@ -111,6 +160,8 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertEqual(metadata["feedback_layer_indices"], [2, 3, 4])
         self.assertEqual(metadata["physical_feedback_layers"], [3, 4, 5])
         self.assertEqual(metadata["feedback_gain_mode"], "independent")
+        self.assertEqual(metadata["feedback_sign"], -1.0)
+        self.assertEqual(metadata["readout_mode"], "output_mean")
         self.assertEqual(metadata["feedback_gain_parameter_count"], 3)
         self.assertTrue(metadata["feedback_memory_enabled"])
         self.assertEqual(metadata["feedback_memory_alpha"], 0.8)
@@ -127,6 +178,8 @@ class TrainLoggingTests(unittest.TestCase):
         )
         message = train_optical._format_feedback_metadata(metadata)
         self.assertIn("feedback_layer_mode=multi", message)
+        self.assertIn("feedback_sign=-1", message)
+        self.assertIn("readout_mode=output_mean", message)
         self.assertIn("SLM3_K=0.500000", message)
         self.assertIn("SLM4_K=1.500000", message)
         self.assertIn("SLM5_K=3.000000", message)
