@@ -844,7 +844,7 @@ class ONNFeedbackPredictor(nn.Module):
                 self.predictor_embed_dim,
             )
         else:
-            temporal_difference = torch.zeros_like(context_chunks)
+            temporal_difference = None
             dense_input = context_dense
         context_dense_after_trace = (
             dense_input.clone() if collect_trace else None

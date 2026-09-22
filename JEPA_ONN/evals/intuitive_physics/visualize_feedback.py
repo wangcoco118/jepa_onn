@@ -263,6 +263,87 @@ def _plot_feature_matrix(
     plt.close(figure)
 
 
+def _temporal_feature_matrix(value, name):
+    array = _to_numpy(value)
+    if array is None:
+        raise RuntimeError(f"temporal difference trace did not contain {name}")
+    if array.ndim >= 3 and array.shape[0] == 1:
+        array = array[0]
+    if array.shape == (8, 196, 384):
+        array = array.reshape(1568, 384)
+    if array.shape != (1568, 384):
+        raise ValueError(
+            f"{name} must have shape (1568, 384) or (8, 196, 384), "
+            f"got {array.shape}"
+        )
+    return np.asarray(array, dtype=np.float32)
+
+
+def _plot_temporal_difference_process(
+    output_dir,
+    context_before,
+    weighted_difference,
+    context_after,
+    alpha,
+):
+    context_limit = _feature_limit(context_before, context_after)
+    difference_limit = _feature_limit(weighted_difference)
+    matrices = (context_before, weighted_difference, context_after)
+    titles = (
+        "Context before difference: Z",
+        f"Weighted temporal difference: alpha * D (alpha={alpha:g})",
+        "Context after difference: Z + alpha * D",
+    )
+    limits = (
+        (-context_limit, context_limit),
+        (-difference_limit, difference_limit),
+        (-context_limit, context_limit),
+    )
+
+    figure, axes = plt.subplots(1, 3, figsize=(23.0, 9.0), squeeze=False)
+    for axis, matrix, title, (vmin, vmax) in zip(
+        axes[0], matrices, titles, limits
+    ):
+        image = axis.imshow(
+            matrix,
+            aspect="auto",
+            interpolation="nearest",
+            cmap="RdBu_r",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        for boundary in range(196, 1568, 196):
+            axis.axhline(
+                boundary - 0.5,
+                color="black",
+                linewidth=0.7,
+                alpha=0.8,
+            )
+        centers = np.arange(98, 1568, 196)
+        axis.set_yticks(centers)
+        axis.set_yticklabels([f"t={index}" for index in range(8)])
+        axis.set_xlabel("feature dimension")
+        axis.set_ylabel("chunk")
+        axis.set_title(title)
+        figure.colorbar(
+            image,
+            ax=axis,
+            label="feature value",
+            shrink=0.86,
+        )
+
+    figure.suptitle("Temporal difference input process")
+    figure.subplots_adjust(wspace=0.42, top=0.90)
+    filename = "figure_G_temporal_difference_process.png"
+    figure.savefig(output_dir / filename, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    return {
+        "filename": filename,
+        "context_limit": context_limit,
+        "difference_limit": difference_limit,
+    }
+
+
 def _save_feature_trace(output_dir, predictor_type, predictor_trace):
     input_features = _sample_tensor(predictor_trace.get("dense_input"))
     if input_features is None:
@@ -271,6 +352,28 @@ def _save_feature_trace(output_dir, predictor_type, predictor_trace):
         raise ValueError(
             f"dense_input must have shape (1568, 384), got {input_features.shape}"
         )
+
+    temporal_difference_enabled = bool(
+        predictor_trace.get("temporal_difference_enabled", False)
+    )
+    temporal_difference_alpha = float(
+        predictor_trace.get("temporal_difference_alpha", 0.5)
+    )
+    temporal_trace_keys = (
+        "context_dense_before_difference",
+        "temporal_difference",
+        "context_dense_after_difference",
+    )
+    if predictor_type == "onn_feedback" and temporal_difference_enabled:
+        missing = [
+            key for key in temporal_trace_keys
+            if predictor_trace.get(key) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "temporal_difference_enabled=True but predictor trace is "
+                f"missing: {', '.join(missing)}"
+            )
 
     transformer_features = None
     if predictor_type == "vit_transformer":
@@ -292,11 +395,24 @@ def _save_feature_trace(output_dir, predictor_type, predictor_trace):
         transformer_features,
     )
     files = ["figure_F_input_1568x384.png"]
+    if predictor_type == "onn_feedback":
+        if temporal_difference_enabled:
+            input_title = (
+                "Final ONN input after temporal enhancement, "
+                "mask-token filling, and position embedding: [1568,384]"
+            )
+        else:
+            input_title = (
+                "Final ONN input after mask-token filling and "
+                "position embedding: [1568,384]"
+            )
+    else:
+        input_title = "Encoder-compressed dense predictor input: [1568,384]"
     _plot_feature_matrix(
         output_dir,
         input_features,
         files[0],
-        "Encoder-compressed dense predictor input: [1568,384]",
+        input_title,
         -feature_limit,
         feature_limit,
     )
@@ -323,7 +439,87 @@ def _save_feature_trace(output_dir, predictor_type, predictor_trace):
             "vmax": feature_limit,
         },
         "color_scale_difference": None,
+        "temporal_difference_enabled": temporal_difference_enabled,
+        "temporal_difference_alpha": temporal_difference_alpha,
+        "has_temporal_difference_plot": False,
+        "temporal_difference_visualization_file": None,
+        "color_scale_temporal_context": None,
+        "color_scale_temporal_difference": None,
+        "context_before_abs_max": None,
+        "temporal_difference_raw_abs_max": None,
+        "temporal_difference_weighted_abs_max": None,
+        "context_after_abs_max": None,
+        "first_chunk_difference_abs_max": None,
+        "target_difference_abs_max": None,
     }
+
+    if predictor_type == "onn_feedback" and temporal_difference_enabled:
+        context_before = _temporal_feature_matrix(
+            predictor_trace["context_dense_before_difference"],
+            "context_dense_before_difference",
+        )
+        raw_difference = _temporal_feature_matrix(
+            predictor_trace["temporal_difference"],
+            "temporal_difference",
+        )
+        context_after = _temporal_feature_matrix(
+            predictor_trace["context_dense_after_difference"],
+            "context_dense_after_difference",
+        )
+        weighted_difference = temporal_difference_alpha * raw_difference
+        plot_info = _plot_temporal_difference_process(
+            output_dir,
+            context_before,
+            weighted_difference,
+            context_after,
+            temporal_difference_alpha,
+        )
+        arrays.update({
+            "G_context_before_difference": context_before,
+            "G_temporal_difference_raw": raw_difference,
+            "G_temporal_difference_weighted": weighted_difference,
+            "G_context_after_difference": context_after,
+        })
+        target_indices = arrays["masks_tgt"]
+        target_difference = None
+        if target_indices is not None:
+            target_indices = np.asarray(
+                target_indices, dtype=np.int64
+            ).reshape(-1)
+            target_difference = raw_difference[target_indices]
+        info.update({
+            "feature_visualization_files": files + [plot_info["filename"]],
+            "has_temporal_difference_plot": True,
+            "temporal_difference_visualization_file": plot_info["filename"],
+            "color_scale_temporal_context": {
+                "vmin": -plot_info["context_limit"],
+                "vmax": plot_info["context_limit"],
+            },
+            "color_scale_temporal_difference": {
+                "vmin": -plot_info["difference_limit"],
+                "vmax": plot_info["difference_limit"],
+            },
+            "context_before_abs_max": float(
+                np.max(np.abs(context_before))
+            ),
+            "temporal_difference_raw_abs_max": float(
+                np.max(np.abs(raw_difference))
+            ),
+            "temporal_difference_weighted_abs_max": float(
+                np.max(np.abs(weighted_difference))
+            ),
+            "context_after_abs_max": float(
+                np.max(np.abs(context_after))
+            ),
+            "first_chunk_difference_abs_max": float(
+                np.max(np.abs(raw_difference[:196]))
+            ),
+            "target_difference_abs_max": (
+                float(np.max(np.abs(target_difference)))
+                if target_difference is not None
+                else None
+            ),
+        })
 
     if transformer_features is not None:
         difference = transformer_features - input_features
@@ -359,7 +555,7 @@ def _save_feature_trace(output_dir, predictor_type, predictor_trace):
             },
         })
 
-    np.savez(output_dir / "feature_trace.npz", **arrays)
+    np.savez_compressed(output_dir / "feature_trace.npz", **arrays)
     info["feature_trace_file"] = "feature_trace.npz"
     info["context_token_count"] = (
         int(arrays["masks_ctxt"].size)
