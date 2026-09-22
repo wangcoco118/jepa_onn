@@ -132,6 +132,12 @@ def _feedback_runtime_metadata(predictor):
     output_mode = getattr(predictor_model, "output_mode", None)
     if output_mode is not None:
         metadata["output_mode"] = output_mode
+    metadata["temporal_difference_enabled"] = bool(
+        getattr(predictor_model, "temporal_difference_enabled", False)
+    )
+    metadata["temporal_difference_alpha"] = float(
+        getattr(predictor_model, "temporal_difference_alpha", 0.5)
+    )
     optical_mapper = getattr(predictor_model, "optical_output_mapper", None)
     if output_mode == "optical" and optical_mapper is not None:
         optical_config = optical_mapper.config
@@ -184,6 +190,9 @@ def _format_feedback_metadata(metadata):
             f"feedback_gain_parameter_count={metadata['feedback_gain_parameter_count']}",
             "feedback_memory_enabled="
             f"{str(metadata['feedback_memory_enabled']).lower()}",
+            "temporal_difference_enabled="
+            f"{str(metadata['temporal_difference_enabled']).lower()}",
+            f"temporal_difference_alpha={metadata['temporal_difference_alpha']:g}",
         ]
     )
     if metadata["feedback_memory_enabled"]:
@@ -1120,6 +1129,12 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
         optical_qkv={} if predictor_type == "onn_feedback" else optical_cfg,
         predictor_type=predictor_type,
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
+        temporal_difference_enabled=args_eval.get("predictor", {}).get(
+            "temporal_difference_enabled", False
+        ),
+        temporal_difference_alpha=args_eval.get("predictor", {}).get(
+            "temporal_difference_alpha", 0.5
+        ),
         optical_output_config=args_eval.get("predictor", {}).get(
             "optical_output"
         ),

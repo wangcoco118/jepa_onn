@@ -30,9 +30,13 @@ class OpticalOutputConfig:
     def from_mapping(cls, values: Mapping[str, object] | None):
         values = dict(values or {})
         allowed = set(cls.__dataclass_fields__)
-        normalized = {
-            key: value for key, value in values.items() if key in allowed
-        }
+        unknown = sorted(set(values).difference(allowed))
+        if unknown:
+            raise ValueError(
+                "unknown optical output config fields: "
+                + ", ".join(unknown)
+            )
+        normalized = dict(values)
         if "slm_intervals_um" in normalized:
             normalized["slm_intervals_um"] = tuple(
                 float(distance) for distance in normalized["slm_intervals_um"]
@@ -42,6 +46,19 @@ class OpticalOutputConfig:
     @property
     def input_dim(self) -> int:
         return self.input_height * self.input_width
+
+    @property
+    def input_padding(self) -> Tuple[int, int, int, int]:
+        pad_height = self.grid_size - self.input_height
+        pad_width = self.grid_size - self.input_width
+        top = pad_height // 2
+        left = pad_width // 2
+        return (
+            left,
+            pad_width - left,
+            top,
+            pad_height - top,
+        )
 
     @property
     def output_dim(self) -> int:
@@ -66,6 +83,10 @@ class OpticalOutputConfig:
             )
         if self.grid_size * self.grid_size != 1024:
             raise ValueError("optical output requires grid_size * grid_size == 1024")
+        if self.input_height > self.grid_size or self.input_width > self.grid_size:
+            raise ValueError(
+                "input_height and input_width must not exceed grid_size"
+            )
         if len(self.slm_intervals_um) != self.num_slm_layers - 1:
             raise ValueError(
                 "slm_intervals_um must contain one distance between the two SLMs"
@@ -116,7 +137,7 @@ class OpticalOutputMapper(nn.Module):
         grid = x_float.reshape(-1, self.config.input_height, self.config.input_width)
         grid = F.pad(
             grid,
-            (4, 4, 8, 8),
+            self.config.input_padding,
             mode="constant",
             value=0.0,
         )

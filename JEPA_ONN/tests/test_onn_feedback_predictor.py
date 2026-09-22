@@ -82,6 +82,18 @@ def full_masks(batch_size=1):
     return context, target
 
 
+def temporal_masks(batch_size=1):
+    context = torch.arange(8, dtype=torch.long) * 196
+    all_tokens = torch.arange(1568, dtype=torch.long)
+    context_flags = torch.ones(1568, dtype=torch.bool)
+    context_flags[context] = False
+    target = all_tokens[context_flags]
+    return (
+        context.unsqueeze(0).repeat(batch_size, 1),
+        target.unsqueeze(0).repeat(batch_size, 1),
+    )
+
+
 def small_onn_values():
     return {
         "input_dim": 2,
@@ -139,6 +151,191 @@ class ONNFeedbackPredictorTests(unittest.TestCase):
             output_mlp_hidden_dim=384,
             onn_core=RecordingONN(384),
         )
+
+    def test_temporal_difference_disabled_preserves_legacy_input(self):
+        predictor = self.make_predictor()
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = full_masks()
+
+        predictor(context, None, masks_ctxt, masks_tgt, collect_trace=True)
+
+        expected = torch.zeros(
+            1, 1568, 384, dtype=predictor.last_trace["dense_input"].dtype
+        )
+        context_384 = predictor.predictor_embed(context)
+        expected.scatter_(
+            1,
+            masks_ctxt.unsqueeze(-1).expand(-1, -1, 384),
+            context_384,
+        )
+        target_placeholder = predictor.mask_token.to(
+            device=context.device, dtype=expected.dtype
+        ).expand(1, masks_tgt.shape[1], 384)
+        expected.scatter_(
+            1,
+            masks_tgt.unsqueeze(-1).expand(-1, -1, 384),
+            target_placeholder,
+        )
+        expected = expected + predictor.predictor_pos_embed.to(
+            device=context.device, dtype=expected.dtype
+        )
+
+        torch.testing.assert_close(
+            predictor.last_trace["dense_input"],
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
+        self.assertFalse(predictor.last_trace["temporal_difference_enabled"])
+        self.assertEqual(predictor.last_trace["temporal_difference_alpha"], 0.5)
+
+    def test_temporal_difference_formula_and_first_chunk_zero(self):
+        torch.manual_seed(17)
+        legacy = self.make_predictor()
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            output_mlp_hidden_dim=384,
+            temporal_difference_enabled=True,
+            temporal_difference_alpha=0.5,
+            onn_core=RecordingONN(384),
+        )
+        predictor.load_state_dict(legacy.state_dict())
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = temporal_masks()
+
+        predictor(context, None, masks_ctxt, masks_tgt, collect_trace=True)
+
+        context_384 = predictor.predictor_embed(context)
+        context_dense = torch.zeros(
+            1, 1568, 384, dtype=context_384.dtype
+        )
+        context_dense.scatter_(
+            1,
+            masks_ctxt.unsqueeze(-1).expand(-1, -1, 384),
+            context_384,
+        )
+        context_chunks = context_dense.reshape(1, 8, 196, 384)
+        expected_difference = torch.cat(
+            [
+                torch.zeros_like(context_chunks[:, :1]),
+                context_chunks[:, 1:] - context_chunks[:, :-1],
+            ],
+            dim=1,
+        )
+        expected_after = (
+            context_chunks
+            + predictor.temporal_difference_alpha * expected_difference
+        )
+
+        torch.testing.assert_close(
+            predictor.last_trace["context_dense_before_difference"],
+            context_dense,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            predictor.last_trace["temporal_difference"],
+            expected_difference,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            predictor.last_trace["context_dense_after_difference"],
+            expected_after.reshape(1, 1568, 384),
+            rtol=0.0,
+            atol=0.0,
+        )
+        self.assertTrue(
+            torch.equal(
+                predictor.last_trace["temporal_difference"][:, 0],
+                torch.zeros_like(
+                    predictor.last_trace["temporal_difference"][:, 0]
+                ),
+            )
+        )
+
+    def test_target_difference_is_zero(self):
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            output_mlp_hidden_dim=384,
+            temporal_difference_enabled=True,
+            temporal_difference_alpha=0.5,
+            onn_core=RecordingONN(384),
+        )
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = temporal_masks()
+
+        predictor(context, None, masks_ctxt, masks_tgt, collect_trace=True)
+
+        difference = predictor.last_trace["temporal_difference"].reshape(
+            1, 1568, 384
+        )
+        target_difference = difference.gather(
+            1, masks_tgt.unsqueeze(-1).expand(-1, -1, 384)
+        )
+        torch.testing.assert_close(
+            target_difference,
+            torch.zeros_like(target_difference),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_final_target_input_keeps_mask_token_and_position(self):
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            output_mlp_hidden_dim=384,
+            temporal_difference_enabled=True,
+            temporal_difference_alpha=0.5,
+            onn_core=RecordingONN(384),
+        )
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = temporal_masks()
+
+        predictor(context, None, masks_ctxt, masks_tgt, collect_trace=True)
+
+        actual = predictor.last_trace["dense_input"].gather(
+            1, masks_tgt.unsqueeze(-1).expand(-1, -1, 384)
+        )
+        expected = predictor.mask_token.to(
+            dtype=actual.dtype, device=actual.device
+        ).expand(1, masks_tgt.shape[1], 384)
+        expected = expected + predictor.predictor_pos_embed.to(
+            dtype=actual.dtype, device=actual.device
+        ).gather(
+            1, masks_tgt.unsqueeze(-1).expand(-1, -1, 384)
+        )
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_temporal_difference_trace_records_config_values(self):
+        predictor = ONNFeedbackPredictor(
+            embed_dim=1024,
+            predictor_embed_dim=384,
+            num_tokens=1568,
+            num_chunks=8,
+            chunk_tokens=196,
+            temporal_difference_enabled=True,
+            temporal_difference_alpha=0.5,
+            onn_core=RecordingONN(384),
+        )
+        context = torch.randn(1, 8, 1024)
+        masks_ctxt, masks_tgt = temporal_masks()
+
+        predictor(context, None, masks_ctxt, masks_tgt)
+
+        self.assertIs(predictor.last_trace["temporal_difference_enabled"], True)
+        self.assertEqual(predictor.last_trace["temporal_difference_alpha"], 0.5)
 
     def test_output_modes_produce_1024_features_and_trace_mode(self):
         context = torch.randn(1, 8, 1024)

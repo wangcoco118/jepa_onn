@@ -465,6 +465,8 @@ class ONNFeedbackPredictor(nn.Module):
         output_mode="mlp",
         optical_output_config=None,
         direct_384_loss=False,
+        temporal_difference_enabled=False,
+        temporal_difference_alpha=0.5,
         feedback_mode="fixed_middle_phase",
         feedback_layer_mode=None,
         feedback_layer_index=None,
@@ -506,6 +508,22 @@ class ONNFeedbackPredictor(nn.Module):
         if not isinstance(direct_384_loss, bool):
             raise TypeError("direct_384_loss must be a boolean")
         self.direct_384_loss = direct_384_loss
+        if not isinstance(temporal_difference_enabled, bool):
+            raise TypeError("temporal_difference_enabled must be a boolean")
+        if isinstance(temporal_difference_alpha, bool):
+            raise ValueError("temporal_difference_alpha must be a finite non-negative number")
+        try:
+            temporal_difference_alpha = float(temporal_difference_alpha)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "temporal_difference_alpha must be a finite non-negative number"
+            ) from exc
+        if not math.isfinite(temporal_difference_alpha) or temporal_difference_alpha < 0.0:
+            raise ValueError(
+                "temporal_difference_alpha must be a finite non-negative number"
+            )
+        self.temporal_difference_enabled = temporal_difference_enabled
+        self.temporal_difference_alpha = temporal_difference_alpha
         if self.output_mode == "optical" and self.direct_384_loss:
             raise ValueError(
                 "output_mode='optical' requires direct_384_loss=False"
@@ -788,17 +806,48 @@ class ONNFeedbackPredictor(nn.Module):
 
         batch_size = ctxt.shape[0]
         context_384 = self.predictor_embed(ctxt)
-        dense_input = torch.zeros(
+        context_dense = torch.zeros(
             batch_size,
             self.num_tokens,
             self.predictor_embed_dim,
             device=ctxt.device,
             dtype=context_384.dtype,
         )
-        dense_input.scatter_(
+        context_dense.scatter_(
             1,
             masks_ctxt.unsqueeze(-1).expand(-1, -1, self.predictor_embed_dim),
             context_384,
+        )
+        context_dense_before_trace = (
+            context_dense.clone() if collect_trace else None
+        )
+        context_chunks = context_dense.reshape(
+            batch_size,
+            self.num_chunks,
+            self.chunk_tokens,
+            self.predictor_embed_dim,
+        )
+        if self.temporal_difference_enabled:
+            temporal_difference = torch.cat(
+                [
+                    torch.zeros_like(context_chunks[:, :1]),
+                    context_chunks[:, 1:] - context_chunks[:, :-1],
+                ],
+                dim=1,
+            )
+            dense_input = (
+                context_chunks
+                + self.temporal_difference_alpha * temporal_difference
+            ).reshape(
+                batch_size,
+                self.num_tokens,
+                self.predictor_embed_dim,
+            )
+        else:
+            temporal_difference = torch.zeros_like(context_chunks)
+            dense_input = context_dense
+        context_dense_after_trace = (
+            dense_input.clone() if collect_trace else None
         )
         target_placeholder = self.mask_token.to(
             device=ctxt.device, dtype=dense_input.dtype
@@ -998,8 +1047,19 @@ class ONNFeedbackPredictor(nn.Module):
             "feedback_memory_enabled": self.feedback_memory_enabled,
             "feedback_memory_alpha": self.feedback_memory_alpha,
             "feedback_mode": self.feedback_mode,
+            "temporal_difference_enabled": self.temporal_difference_enabled,
+            "temporal_difference_alpha": self.temporal_difference_alpha,
         }
         if collect_trace:
+            self.last_trace["context_dense_before_difference"] = _detach_trace_value(
+                context_dense_before_trace
+            )
+            self.last_trace["temporal_difference"] = _detach_trace_value(
+                temporal_difference
+            )
+            self.last_trace["context_dense_after_difference"] = _detach_trace_value(
+                context_dense_after_trace
+            )
             self.last_trace["chunks"] = trace_chunks
             self.last_trace["base_phases"] = (
                 trace_chunks[0].get("base_phases") if trace_chunks else None

@@ -33,3 +33,5 @@ datasets/
 # Temporary files
 *.log
 *.tmp
+# Experiment artifacts
+*.npz

@@ -264,6 +264,12 @@ def main(args_eval, resume_preempt=False):
         predictor_checkpoint=predictor_checkpoint,
         predictor_type=args_eval.get("predictor_type", "onn_feedback"),
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
+        temporal_difference_enabled=args_eval.get("predictor", {}).get(
+            "temporal_difference_enabled", False
+        ),
+        temporal_difference_alpha=args_eval.get("predictor", {}).get(
+            "temporal_difference_alpha", 0.5
+        ),
         optical_output_config=args_eval.get("predictor", {}).get(
             "optical_output"
         ),
@@ -729,6 +735,8 @@ def init_model(
     predictor_checkpoint=None,
     predictor_type="vit_transformer",
     output_mode="mlp",
+    temporal_difference_enabled=False,
+    temporal_difference_alpha=0.5,
     optical_output_config=None,
     direct_384_loss=False,
     onn_feedback_config=None,
@@ -764,6 +772,8 @@ def init_model(
                 embed_dim=encoder.backbone.embed_dim,
                 predictor_embed_dim=pred_embed_dim,
                 output_mode=output_mode,
+                temporal_difference_enabled=temporal_difference_enabled,
+                temporal_difference_alpha=temporal_difference_alpha,
                 optical_output_config=optical_output_config,
                 direct_384_loss=direct_384_loss,
                 num_tokens=1568,

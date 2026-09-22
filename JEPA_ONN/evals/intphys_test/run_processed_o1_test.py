@@ -231,6 +231,12 @@ def _load_models(checkpoint_path, config, device):
         pred_checkpoint_key=pretrain_cfg.get("pred_checkpoint_key", "predictor"),
         pred_embed_dim=predictor_cfg["predictor_dim"],
         output_mode=predictor_cfg.get("output_mode", "mlp"),
+        temporal_difference_enabled=predictor_cfg.get(
+            "temporal_difference_enabled", False
+        ),
+        temporal_difference_alpha=predictor_cfg.get(
+            "temporal_difference_alpha", 0.5
+        ),
         direct_384_loss=predictor_cfg.get("direct_384_loss", False),
         pred_depth=pretrain_cfg.get("pred_depth", 12),
         optical_qkv={},

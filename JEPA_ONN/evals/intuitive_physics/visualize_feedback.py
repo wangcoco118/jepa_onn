@@ -1066,6 +1066,12 @@ def main():
         ),
         pred_embed_dim=runtime_config["predictor"].get("predictor_dim", 384),
         output_mode=runtime_config["predictor"].get("output_mode", "mlp"),
+        temporal_difference_enabled=runtime_config["predictor"].get(
+            "temporal_difference_enabled", False
+        ),
+        temporal_difference_alpha=runtime_config["predictor"].get(
+            "temporal_difference_alpha", 0.5
+        ),
         optical_output_config=runtime_config["predictor"].get(
             "optical_output"
         ),

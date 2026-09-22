@@ -17,6 +17,38 @@ class OpticalOutputMapperTests(unittest.TestCase):
         self.assertEqual(config.output_distance_um, 8000.0)
         self.assertEqual(config.all_distances_um, (8000.0, 8000.0, 8000.0))
 
+    def test_padding_is_derived_from_configured_input_shape(self):
+        config = OpticalOutputConfig(input_height=12, input_width=32)
+        mapper = OpticalOutputMapper(config)
+        x = torch.zeros(1, 1, 384)
+        x[0, 0, 0] = 5.0
+
+        debug = mapper.inspect_input(x)
+
+        self.assertEqual(tuple(debug["optical_input_grid"].shape), (1, 32, 32))
+        self.assertEqual(debug["optical_input_grid"][0, 10, 0].item(), 5.0)
+        self.assertEqual(debug["optical_input_amplitude"][0, 0, 0].item(), 0.0)
+
+    def test_unknown_optical_output_config_field_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            OpticalOutputConfig.from_mapping({"input_widht": 24})
+
+    def test_optical_yaml_write_tag_has_single_output_suffix(self):
+        import yaml
+
+        with open(
+            "evals/intuitive_physics/configs/onn_feedback_optical_output.yaml",
+            encoding="utf-8",
+        ) as handle:
+            config = yaml.safe_load(handle)
+
+        write_tag = config["pretrain"]["write_tag"]
+        self.assertEqual(
+            write_tag,
+            "vjepa_vitl16_onn_feedback_optical_output",
+        )
+        self.assertNotIn("optical_output_optical_output", write_tag)
+
     def test_invalid_fixed_geometry_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "num_slm_layers"):
             OpticalOutputConfig(num_slm_layers=3)
