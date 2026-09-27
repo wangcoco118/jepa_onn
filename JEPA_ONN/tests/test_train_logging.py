@@ -212,5 +212,76 @@ class TrainLoggingTests(unittest.TestCase):
 
 
 
+    def test_training_summary_recursively_records_effective_config_with_chinese_comments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "training_summary.txt"
+            config = {
+                "training": {"epochs": 25},
+                "data": {"batch_size": 15},
+                "onn": {"feedback_enabled": True},
+                "custom": {"new_parameter": [1, 2]},
+            }
+
+            train_optical._write_training_summary(
+                summary_path,
+                config,
+                stage="start",
+                cli_args={"gpu": 2, "learning_rate": 1e-4},
+                runtime_metadata={"output_path": "/tmp/model.pt"},
+            )
+
+            summary = summary_path.read_text(encoding="utf-8")
+            self.assertIn("[\u8fd0\u884c\u4fe1\u606f]", summary)
+            self.assertIn("status = running", summary)
+            self.assertIn("training.epochs = 25  # \u603b\u8bad\u7ec3\u8f6e\u6570", summary)
+            self.assertIn("data.batch_size = 15  # \u6bcf\u4e2a\u8bad\u7ec3\u6279\u6b21\u7684\u6837\u672c\u6570", summary)
+            self.assertIn(
+                "custom.new_parameter = [1, 2]  # \u53ef\u914d\u7f6e\u53c2\u6570\uff1acustom.new_parameter",
+                summary,
+            )
+            assignment_lines = [
+                line
+                for line in summary.splitlines()
+                if " = " in line and not line.startswith("status = ")
+            ]
+            self.assertTrue(assignment_lines)
+            self.assertTrue(all("  # " in line for line in assignment_lines))
+
+    def test_training_summary_appends_runtime_and_final_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "training_summary.txt"
+            config = {"training": {"epochs": 3}}
+            train_optical._write_training_summary(summary_path, config, stage="start")
+            train_optical._write_training_summary(
+                summary_path,
+                config,
+                stage="runtime",
+                runtime_metadata={"trainable_parameter_count": 123},
+            )
+            train_optical._write_training_summary(
+                summary_path,
+                config,
+                stage="complete",
+                results={
+                    "best_epoch": 2,
+                    "best_val_loss": 0.125,
+                    "best_checkpoint": "/tmp/best.pt",
+                },
+            )
+
+            summary = summary_path.read_text(encoding="utf-8")
+            self.assertIn("status = completed", summary)
+            self.assertNotIn("status = running", summary)
+            self.assertEqual(summary.count("[\u5b8c\u6574\u751f\u6548\u914d\u7f6e]"), 1)
+            self.assertIn("[\u8fd0\u884c\u65f6\u6d3e\u751f\u53c2\u6570]", summary)
+            self.assertIn(
+                "runtime.trainable_parameter_count = 123  # \u53ef\u8bad\u7ec3\u53c2\u6570\u603b\u6570",
+                summary,
+            )
+            self.assertIn("[\u6700\u7ec8\u7ed3\u679c]", summary)
+            self.assertIn("result.best_epoch = 2  # \u9a8c\u8bc1\u96c6\u8868\u73b0\u6700\u4f73\u7684\u8f6e\u6b21", summary)
+            self.assertIn("result.best_val_loss = 0.125  # \u6700\u4f73\u9a8c\u8bc1\u635f\u5931", summary)
+
+
 if __name__ == "__main__":
     unittest.main()

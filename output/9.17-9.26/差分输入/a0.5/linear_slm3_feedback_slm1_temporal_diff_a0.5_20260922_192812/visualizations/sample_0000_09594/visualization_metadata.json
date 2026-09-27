@@ -1,0 +1,301 @@
+{
+  "checkpoint": "/data/linux/wkx/IntPhys/references_code/jepa_onn/output/9.17-9.26/差分输入/a0.5/linear_slm3_feedback_slm1_temporal_diff_a0.5_20260922_192812/linear_slm3_feedback_slm1_temporal_diff_a0.5_25ep_bs25_gpu3_20260922_192807",
+  "checkpoint_path": "/data/linux/wkx/IntPhys/references_code/jepa_onn/output/9.17-9.26/差分输入/a0.5/linear_slm3_feedback_slm1_temporal_diff_a0.5_20260922_192812/linear_slm3_feedback_slm1_temporal_diff_a0.5_25ep_bs25_gpu3_20260922_192807",
+  "checkpoint_mode": "onn_feedback",
+  "predictor_type": "onn_feedback",
+  "sample_index": 0,
+  "video_id": "09594",
+  "sample_id": "sample_0000_09594",
+  "num_chunks": 8,
+  "chunk_tokens": 196,
+  "num_slm_layers": 3,
+  "feedback_layer_mode": "single",
+  "feedback_layer_indices": [
+    1
+  ],
+  "physical_feedback_layers": [
+    2
+  ],
+  "feedback_memory_enabled": false,
+  "feedback_memory_alpha": 0.8,
+  "feedback_phase_max_rad": 1.5707963267948966,
+  "phase_display_range": [
+    -3.141592653589793,
+    3.141592653589793
+  ],
+  "output_definition": "learnable_offset",
+  "detector_intensity_definition": "|detector_field|^2",
+  "detector_phase_definition": "angle(detector_field)",
+  "effective_phase_definition": "base_phase_plus_feedback_delta",
+  "feedback_state_definition": "normalize_feedback_output(previous_output)",
+  "feedback_state_valid": [
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "feedback_visualization_files": [
+    "feedback_metrics.csv",
+    "figure_C_feedback_and_effective_phase.png",
+    "figure_C_effective_phase_contrast.png",
+    "figure_D1_feedback_curves.png"
+  ],
+  "feedback_visualizations_skipped": false,
+  "feedback_source_kind": [
+    "none",
+    "previous_output",
+    "previous_output",
+    "previous_output",
+    "previous_output",
+    "previous_output",
+    "previous_output",
+    "previous_output"
+  ],
+  "prediction_shape": [
+    1,
+    1248,
+    1024
+  ],
+  "config": {
+    "predictor_type": "onn_feedback",
+    "mask_mode": "unified_random",
+    "pretrain": {
+      "enc_checkpoint_key": "encoder",
+      "pred_checkpoint_key": "predictor",
+      "model_name": "vit_large",
+      "patch_size": 16,
+      "folder": "/data/linux/wkx/IntPhys/references_code/references/checkpoints/vjepa",
+      "checkpoint": "vitl16.pth.tar",
+      "write_tag": "vjepa_vitl16_onn_feedback",
+      "use_sdpa": true,
+      "use_silu": false,
+      "wide_silu": false,
+      "uniform_power": true,
+      "is_causal": false,
+      "pred_is_causal": false,
+      "pred_depth": 12,
+      "tubelet_size": 2,
+      "frames_per_clip": 16
+    },
+    "data": {
+      "batch_size": 25,
+      "resolution": 224,
+      "stride_sliding_window": 2,
+      "use_bfloat16": true,
+      "frames_per_clip": 16,
+      "context_lengths": [
+        2,
+        4,
+        6,
+        8,
+        10
+      ],
+      "frame_steps": 2
+    },
+    "data_split": {
+      "source": "train",
+      "manifest": "/data/linux/wkx/IntPhys/references_code/references/splits/intphys_train_2000_val_200.json",
+      "num_train_videos": 2000,
+      "num_val_videos": 200,
+      "split_seed": 42
+    },
+    "training": {
+      "mode": "end_to_end_jepa",
+      "experiment_mode": "onn_feedback",
+      "epochs": 25,
+      "split_manifest": "/data/linux/wkx/IntPhys/references_code/references/splits/intphys_train_2000_val_200.json",
+      "last_output": null,
+      "clip_grad": 10.0
+    },
+    "predictor": {
+      "context_dim": 1024,
+      "predictor_dim": 384,
+      "output_dim": 1024,
+      "num_tokens": 1568,
+      "num_chunks": 8,
+      "chunk_tokens": 196,
+      "output_mlp_hidden_dim": 384,
+      "output_mode": "linear",
+      "temporal_difference_enabled": true,
+      "temporal_difference_alpha": 0.5
+    },
+    "onn": {
+      "input_dim": 384,
+      "output_dim": 384,
+      "num_slm_layers": 3,
+      "feedback_mode": "fixed_middle_phase",
+      "feedback_enabled": true,
+      "feedback_memory_enabled": false,
+      "feedback_memory_alpha": 0.8,
+      "feedback_layer_mode": "single",
+      "feedback_phase_max_rad": 1.5707963267948966,
+      "feedback_gain_init": 0.33,
+      "readout_mode": "intensity_minus_learnable_offset",
+      "learnable_intensity_offset": true,
+      "use_differential_detector": false,
+      "pixel_pitch_um": 8.0,
+      "wavelength_nm": 532.0,
+      "slm_intervals_um": [
+        25000.0,
+        25000.0
+      ],
+      "input_to_first_slm_um": 50000.0,
+      "last_slm_to_detector_um": 50000.0,
+      "asm_padding_factor": 2.0,
+      "input_encoding_mode": "signed_phase",
+      "feedback_layer_index": 1
+    },
+    "tag": "vjepa_vitl16_onn_feedback_linear_slm3_feedback_slm1_temporal_diff_a0.5",
+    "nodes": 1,
+    "tasks_per_node": 1,
+    "eval_name": "intuitive_physics",
+    "dataset": "intphys",
+    "loss": {
+      "loss_exp": 1.0,
+      "reg_coeff": 0.0
+    },
+    "evaluation": {
+      "run_after_training": true
+    }
+  },
+  "input_visualization": {
+    "input_phase": "angle(encoded_input)",
+    "input_amplitude": "abs(encoded_input)",
+    "input_phase_difference": "wrapped(input_phase_t - input_phase_0)"
+  },
+  "contrast_figures": {
+    "base_phase": "base_phase - pi",
+    "detector_output": "y_t - y_0",
+    "detector_phase": "wrapped phase_t - phase_0",
+    "effective_phase": "wrapped(phi_eff - phi_base)"
+  },
+  "contrast_scale_note": "contrast figures use global symmetric percentile limits; they are for visibility and not a replacement for absolute-scale figures",
+  "base_phase_statistics": [
+    {
+      "physical_slm_index": 1,
+      "min": 2.883028507232666,
+      "max": 3.3914012908935547,
+      "mean": 3.1423370838165283,
+      "std": 0.07037049531936646
+    },
+    {
+      "physical_slm_index": 2,
+      "min": 2.8681600093841553,
+      "max": 3.4074079990386963,
+      "mean": 3.1414992809295654,
+      "std": 0.07279133051633835
+    },
+    {
+      "physical_slm_index": 3,
+      "min": 2.856743335723877,
+      "max": 3.408668041229248,
+      "mean": 3.1426217555999756,
+      "std": 0.07765509933233261
+    }
+  ],
+  "output_statistics": {
+    "min": -0.057583265006542206,
+    "max": 4.462270259857178,
+    "mean": 0.45944297313690186,
+    "std": 0.5855706930160522
+  },
+  "input_statistics": {
+    "input_phase": {
+      "min": -3.1415927410125732,
+      "max": 0.0,
+      "mean": -0.5739749073982239,
+      "std": 1.2139803171157837
+    },
+    "input_amplitude": {
+      "min": 1.8388858734397218e-05,
+      "max": 1.0,
+      "mean": 0.6689925789833069,
+      "std": 0.4139229953289032
+    },
+    "input_phase_difference": {
+      "min": -3.1415927410125732,
+      "max": 3.1415927410125732,
+      "mean": -0.013445801101624966,
+      "std": 0.8067301511764526
+    }
+  },
+  "contrast_statistics": {
+    "base_phase_deviation": {
+      "min": -0.2848494052886963,
+      "max": 0.2670753002166748,
+      "mean": 0.000560023938305676,
+      "std": 0.07366948574781418
+    },
+    "chunk_output_delta": {
+      "min": -2.186668872833252,
+      "max": 2.6680495738983154,
+      "mean": 0.006977131590247154,
+      "std": 0.3333623707294464
+    },
+    "detector_phase_difference": {
+      "min": -3.141585350036621,
+      "max": 3.141577959060669,
+      "mean": 0.05496930703520775,
+      "std": 0.9333211779594421
+    },
+    "effective_phase_deviation": {
+      "min": -0.6481860280036926,
+      "max": 1.4749128818511963,
+      "mean": -0.017948120832443237,
+      "std": 0.41268351674079895
+    }
+  },
+  "output_color_scale": {
+    "method": "global 0.5-99.5 percentile",
+    "centered_at_zero_if_signed": true,
+    "vmin": -2.8057727813720703,
+    "vmax": 2.8057727813720703
+  },
+  "feedback_state_color_scale": {
+    "method": "global 0.5-99.5 percentile, zero-centered",
+    "vmin": -3.579111337661743,
+    "vmax": 3.579111337661743
+  },
+  "feature_visualization_files": [
+    "figure_F_input_1568x384.png",
+    "figure_G_temporal_difference_process.png"
+  ],
+  "feature_input_shape": [
+    1568,
+    384
+  ],
+  "feature_output_shape": null,
+  "predictor_dim": 384,
+  "has_transformer_output": false,
+  "has_difference_plot": false,
+  "color_scale_input_output": {
+    "vmin": -3.0724897384643555,
+    "vmax": 3.0724897384643555
+  },
+  "color_scale_difference": null,
+  "temporal_difference_enabled": true,
+  "temporal_difference_alpha": 0.5,
+  "has_temporal_difference_plot": true,
+  "temporal_difference_visualization_file": "figure_G_temporal_difference_process.png",
+  "color_scale_temporal_context": {
+    "vmin": -2.1847240924835205,
+    "vmax": 2.1847240924835205
+  },
+  "color_scale_temporal_difference": {
+    "vmin": -0.7075309753417969,
+    "vmax": 0.7075309753417969
+  },
+  "context_before_abs_max": 4.834066390991211,
+  "temporal_difference_raw_abs_max": 3.886223316192627,
+  "temporal_difference_weighted_abs_max": 1.9431116580963135,
+  "context_after_abs_max": 5.826074600219727,
+  "first_chunk_difference_abs_max": 0.0,
+  "target_difference_abs_max": 0.0,
+  "feature_trace_file": "feature_trace.npz",
+  "context_token_count": 320,
+  "target_token_count": 1248
+}

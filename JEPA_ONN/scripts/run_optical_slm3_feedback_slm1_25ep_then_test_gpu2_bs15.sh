@@ -33,7 +33,7 @@ export PYTHONPATH=.
 export TMPDIR="$TMP_ROOT"
 export XDG_CACHE_HOME="$CACHE_ROOT"
 
-echo "PIPELINE_START physical_gpu=2 logical_device=cuda:0 train_epochs=25 train_batch_size=15 test_batch_size=15 output_mode=optical optical_output_slm_layers=2 onn_core_slm_layers=3 feedback_layer_index=1 readout_mode=learnable_offset feedback_sign=1.0"
+echo "PIPELINE_START physical_gpu=2 logical_device=cuda:0 train_epochs=25 train_batch_size=15 test_batch_size=15 output_mode=optical optical_output_slm_layers=2 onn_core_slm_layers=3 feedback_layer_index=1 readout_mode=learnable_offset feedback_sign=1.0 test_resume_every_batches=20"
 nvidia-smi -i 2 --query-gpu=index,uuid,name,memory.total,memory.used,memory.free --format=csv,noheader
 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
 
@@ -93,6 +93,11 @@ config["mode"] = "all"
 config["nodes"] = 1
 config["tasks_per_node"] = 1
 config.setdefault("data", {})["batch_size"] = 15
+config["test_resume"] = {
+    "enabled": True,
+    "checkpoint_path": str((output_dir / "test_resume_latest.pt").resolve()),
+    "save_every_batches": 20,
+}
 
 with test_config_path.open("w", encoding="utf-8") as handle:
     yaml.safe_dump(config, handle, sort_keys=False, allow_unicode=True)

@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import json
 import logging
 import os
 import sys
@@ -234,6 +235,212 @@ def _format_feedback_metadata(metadata):
     return " ".join(parts)
 
 
+_TRAINING_SUMMARY_COMMENTS = {
+    "created_at": "训练摘要创建时间",
+    "updated_at": "本节写入时间",
+    "cli.config": "训练配置文件路径",
+    "cli.output": "训练输出基础名称",
+    "cli.mode": "兼容模式参数",
+    "cli.experiment_mode": "本次训练实验模式",
+    "cli.gpu": "单卡训练选择的可见 GPU 编号",
+    "cli.gpus": "多卡训练选择的可见 GPU 编号列表",
+    "cli.dist_port": "分布式训练通信端口",
+    "cli.epochs": "命令行覆盖的训练轮数",
+    "cli.max_steps": "每轮最多训练批次数",
+    "cli.learning_rate": "优化器学习率",
+    "cli.batch_size": "命令行覆盖的批大小",
+    "cli.feedback_enabled": "命令行覆盖的反馈开关",
+    "cli.mask_mode": "命令行覆盖的掩码模式",
+    "cli.target_node": "实时蒸馏的目标节点",
+    "cli.log_file": "训练日志文件名",
+    "cli.split_manifest": "训练验证划分文件",
+    "cli.last_output": "最后一轮模型文件名",
+    "cli.resume": "断点续训模型路径",
+    "cli.skip_final_eval": "训练结束后是否跳过自动评估",
+    "training.experiment_mode": "训练实验模式",
+    "training.mode": "训练模式",
+    "training.epochs": "总训练轮数",
+    "training.max_steps": "每轮最多训练批次数",
+    "training.learning_rate": "优化器学习率",
+    "training.clip_grad": "梯度裁剪阈值",
+    "data.batch_size": "每个训练批次的样本数",
+    "data.num_workers": "数据加载进程数",
+    "data.frames_per_clip": "每个视频片段使用的帧数",
+    "data.frame_step": "视频帧采样步长",
+    "data.resolution": "输入图像分辨率",
+    "mask_mode": "上下文与目标特征的掩码生成模式",
+    "data_split.num_train_videos": "训练集视频数量",
+    "data_split.num_val_videos": "验证集视频数量",
+    "data_split.split_seed": "训练验证划分随机种子",
+    "pretrain.folder": "预训练模型所在目录",
+    "pretrain.checkpoint": "预训练模型文件名",
+    "pretrain.model_name": "冻结特征提取器的模型名称",
+    "pretrain.patch_size": "视觉编码器空间块大小",
+    "pretrain.tubelet_size": "视觉编码器时间块大小",
+    "onn.num_slm_layers": "ONN 中的 SLM 总层数",
+    "onn.feedback_enabled": "是否启用物理反馈通路",
+    "onn.feedback_layer_index": "反馈注入层索引（从 0 开始）",
+    "onn.feedback_layer_indices": "多反馈注入层索引列表（从 0 开始）",
+    "onn.feedback_layer_mode": "单反馈层或多反馈层模式",
+    "onn.feedback_gain_mode": "多反馈层增益共享方式",
+    "onn.feedback_gain_init": "反馈增益初始值",
+    "onn.feedback_phase_max_rad": "反馈相位最大绝对值（弧度）",
+    "onn.feedback_sign": "反馈符号，正值为正反馈，负值为负反馈",
+    "onn.feedback_memory_enabled": "是否启用跨时间块反馈记忆",
+    "onn.feedback_memory_alpha": "反馈记忆的历史状态权重",
+    "onn.readout_mode": "ONN 输出读出方式",
+    "onn.output_mode": "预测器最终输出映射方式",
+    "onn.direct_384_loss": "是否直接在 384 维特征上计算损失",
+    "onn.input_dim": "ONN 输入特征维度",
+    "onn.output_dim": "ONN 输出特征维度",
+    "onn.chunk_tokens": "每个时间块包含的 token 数",
+    "onn.grid_height": "光学计算网格高度",
+    "onn.grid_width": "光学计算网格宽度",
+    "onn.wavelength_nm": "光学传播波长（纳米）",
+    "onn.pixel_size_um": "光学网格像素尺寸（微米）",
+    "onn.slm_intervals_um": "相邻 SLM 之间的传播距离（微米）",
+    "onn.input_to_first_slm_um": "输入面到第一层 SLM 的距离（微米）",
+    "onn.last_slm_to_detector_um": "最后一层 SLM 到探测器的距离（微米）",
+    "onn.asm_padding_factor": "角谱传播的填充倍率",
+    "runtime.output_path": "最佳模型保存路径",
+    "runtime.last_output": "最后一轮模型保存路径",
+    "runtime.final_output": "最终模型预留路径",
+    "runtime.log_path": "训练日志路径",
+    "runtime.split_manifest": "实际使用的数据划分文件路径",
+    "runtime.gpu_ids": "本次训练使用的物理 GPU 编号",
+    "runtime.world_size": "分布式训练进程总数",
+    "runtime.device": "当前训练进程使用的计算设备",
+    "runtime.experiment_mode": "运行时解析后的实验模式",
+    "runtime.trainable_parameter_count": "可训练参数总数",
+    "runtime.predictor_trainable_parameter_count": "预测器可训练参数总数",
+    "runtime.encoder_trainable_parameter_count": "上下文编码器可训练参数总数",
+    "runtime.target_encoder_trainable_parameter_count": "目标编码器可训练参数总数",
+    "runtime.feedback_enabled": "运行时实际生效的反馈开关",
+    "runtime.feedback_layer_index": "运行时实际反馈层索引（从 0 开始）",
+    "runtime.feedback_layer_indices": "运行时实际多反馈层索引列表（从 0 开始）",
+    "runtime.physical_feedback_layers": "按 1 开始编号的实际反馈 SLM 层",
+    "runtime.effective_feedback_gains": "运行时实际反馈增益",
+    "runtime.feedback_memory_enabled": "运行时实际反馈记忆开关",
+    "runtime.output_mode": "运行时实际输出模式",
+    "result.best_epoch": "验证集表现最佳的轮次",
+    "result.best_val_loss": "最佳验证损失",
+    "result.best_val_jepa_loss": "最佳验证 JEPA 损失",
+    "result.last_train_loss": "最后一轮训练损失",
+    "result.last_train_jepa_loss": "最后一轮训练 JEPA 损失",
+    "result.last_val_jepa_loss": "最后一轮验证 JEPA 损失",
+    "result.final_train_nmse": "最后一轮训练归一化均方误差",
+    "result.final_train_cosine": "最后一轮训练余弦相似度",
+    "result.global_step": "累计完成的训练批次数",
+    "result.elapsed_seconds": "本次训练总耗时（秒）",
+    "result.best_checkpoint": "最佳模型文件路径",
+    "result.last_checkpoint": "最后一轮模型文件路径",
+    "result.final_checkpoint": "最终模型文件路径",
+}
+
+
+def _flatten_training_summary(mapping, prefix=""):
+    """Recursively flatten a nested configuration without dropping any field."""
+    if not isinstance(mapping, dict):
+        return [(prefix, mapping)]
+    flattened = []
+    for key, value in mapping.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            if value:
+                flattened.extend(_flatten_training_summary(value, path))
+            else:
+                flattened.append((path, value))
+        else:
+            flattened.append((path, value))
+    return flattened
+
+
+def _training_summary_value(value):
+    if isinstance(value, Path):
+        value = str(value)
+    if isinstance(value, str):
+        return value.replace("\n", "\\n")
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "null"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return str(value)
+
+
+def _training_summary_comment(path):
+    return _TRAINING_SUMMARY_COMMENTS.get(path, f"可配置参数：{path}")
+
+
+def _training_summary_lines(mapping, prefix=""):
+    return [
+        f"{path} = {_training_summary_value(value)}  # {_training_summary_comment(path)}"
+        for path, value in _flatten_training_summary(mapping, prefix)
+    ]
+
+
+def _write_training_summary(
+    summary_path,
+    config,
+    stage,
+    runtime_metadata=None,
+    results=None,
+    cli_args=None,
+):
+    """Write or extend the human-readable training parameter/result record."""
+    summary_path = Path(summary_path)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    stage = str(stage)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    if stage == "start":
+        lines = [
+            "# 训练参数与结果摘要",
+            "# 本文件由训练程序自动生成；配置项为命令行覆盖后的完整生效配置。",
+            "",
+            "[运行信息]",
+            "status = running",
+            f"created_at = {now}  # {_training_summary_comment('created_at')}",
+        ]
+        if runtime_metadata:
+            lines.extend(_training_summary_lines(runtime_metadata, "runtime"))
+        lines.extend(["", "[命令行参数]"])
+        lines.extend(_training_summary_lines(cli_args or {}, "cli"))
+        lines.extend(["", "[完整生效配置]"])
+        lines.extend(_training_summary_lines(config or {}))
+        summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return summary_path
+
+    if not summary_path.exists():
+        _write_training_summary(
+            summary_path,
+            config,
+            stage="start",
+        )
+
+    current = summary_path.read_text(encoding="utf-8")
+    if stage == "runtime":
+        section = ["", "[运行时派生参数]"]
+        section.extend(_training_summary_lines(runtime_metadata or {}, "runtime"))
+    elif stage == "complete":
+        current = current.replace("status = running", "status = completed", 1)
+        section = [
+            "",
+            "[最终结果]",
+            f"result.completed_at = {now}  # 训练完成时间",
+        ]
+        section.extend(_training_summary_lines(results or {}, "result"))
+    else:
+        raise ValueError(f"unsupported training summary stage: {stage}")
+
+    summary_path.write_text(
+        current.rstrip() + "\n" + "\n".join(section) + "\n",
+        encoding="utf-8",
+    )
+    return summary_path
+
+
 def _distributed_worker(rank, config, args, outputs, gpu_ids):
     world_size = len(gpu_ids)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -367,6 +574,7 @@ def _resolve_run_outputs(output_arg, project_root=None, timestamp=None):
         ),
         "log": Path(f"{output_path}.log"),
         "split_manifest": Path(f"{output_path}.split.json"),
+        "training_summary": run_dir / "training_summary.txt",
     }
 
 
@@ -1557,6 +1765,23 @@ def run(
     logger.info("model_prepare_done elapsed_s=%.3f", time.perf_counter() - model_started)
 
     trainable = list(optical_parameters(student_predictor))
+    _write_training_summary(
+        Path(output_path).parent / "training_summary.txt",
+        args_eval,
+        stage="runtime",
+        runtime_metadata={
+            "experiment_mode": "realtime_last_node_distillation",
+            "device": str(device),
+            "world_size": 1,
+            "trainable_parameter_count": sum(
+                parameter.numel() for parameter in trainable
+            ),
+            "output_path": os.path.abspath(output_path),
+            "last_output": os.path.abspath(last_output),
+            "log_path": os.path.abspath(log_path),
+            "split_manifest": os.path.abspath(split_manifest),
+        },
+    )
     if not trainable:
         raise RuntimeError("no optical parameters are trainable")
     optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
@@ -1655,6 +1880,20 @@ def run(
         epochs,
         os.path.abspath(output_path),
         time.perf_counter() - save_started,
+    )
+    _write_training_summary(
+        Path(output_path).parent / "training_summary.txt",
+        args_eval,
+        stage="complete",
+        results={
+            "best_epoch": epochs,
+            "last_train_loss": last_train_metrics["train_loss"],
+            "final_train_nmse": last_train_metrics["train_nmse"],
+            "final_train_cosine": last_train_metrics["train_cosine"],
+            "global_step": global_step,
+            "elapsed_seconds": time.perf_counter() - run_started,
+            "final_checkpoint": os.path.abspath(output_path),
+        },
     )
     logger.info(
         "run_done mode=realtime_last_node_distillation target_node=%s "
@@ -1798,6 +2037,30 @@ def run_end_to_end_jepa(
         for parameter in target_encoder.parameters()
         if parameter.requires_grad
     )
+    if int(rank) == 0:
+        runtime_metadata = {
+            "experiment_mode": experiment_mode,
+            "device": str(device),
+            "world_size": world_size,
+            "gpu_ids": gpu_ids,
+            "predictor_trainable_parameter_count": sum(
+                parameter.numel() for parameter in trainable
+            ),
+            "encoder_trainable_parameter_count": encoder_trainable,
+            "target_encoder_trainable_parameter_count": target_encoder_trainable,
+            "output_path": os.path.abspath(output_path),
+            "last_output": os.path.abspath(last_output),
+            "final_output": os.path.abspath(final_output),
+            "log_path": os.path.abspath(log_path),
+            "split_manifest": os.path.abspath(split_manifest),
+        }
+        runtime_metadata.update(_feedback_runtime_metadata(predictor))
+        _write_training_summary(
+            Path(output_path).parent / "training_summary.txt",
+            args_eval,
+            stage="runtime",
+            runtime_metadata=runtime_metadata,
+        )
     if encoder_trainable or target_encoder_trainable:
         raise RuntimeError(
             "context encoder and target encoder must be fully frozen"
@@ -2020,6 +2283,29 @@ def run_end_to_end_jepa(
                 )
             else:
                 raise RuntimeError("no best end_to_end_jepa checkpoint was produced")
+        _write_training_summary(
+            Path(output_path).parent / "training_summary.txt",
+            args_eval,
+            stage="complete",
+            results={
+                "best_epoch": best_epoch,
+                "best_val_jepa_loss": best_val_loss,
+                "last_train_jepa_loss": (
+                    train_metrics["jepa_loss"]
+                    if "train_metrics" in locals()
+                    else None
+                ),
+                "last_val_jepa_loss": (
+                    val_metrics["jepa_loss"]
+                    if "val_metrics" in locals()
+                    else None
+                ),
+                "global_step": global_step,
+                "elapsed_seconds": time.perf_counter() - run_started,
+                "best_checkpoint": os.path.abspath(output_path),
+                "last_checkpoint": os.path.abspath(last_output),
+            },
+        )
         logger.info(
             "run_done experiment_mode=%s world_size=%d gpu_ids=%s best_epoch=%d "
             "best_val_jepa_loss=%.6f best=%s last=%s "
@@ -2229,6 +2515,32 @@ def main():
         training_cfg["experiment_mode"] = args.experiment_mode
 
     gpu_ids = _resolve_gpu_ids(args.gpu, args.gpus)
+    summary_config = copy.deepcopy(config)
+    summary_training = summary_config.setdefault("training", {})
+    if args.epochs is not None:
+        summary_training["epochs"] = int(args.epochs)
+    if args.max_steps is not None:
+        summary_training["max_steps"] = int(args.max_steps)
+    summary_training["learning_rate"] = float(args.learning_rate)
+    summary_runtime = {
+        "experiment_mode": _resolve_experiment_mode(summary_config),
+        "gpu_ids": gpu_ids,
+        "world_size": len(gpu_ids),
+        "output_path": os.path.abspath(outputs["output"]),
+        "last_output": os.path.abspath(outputs["last_output"]),
+        "final_output": os.path.abspath(outputs["final_output"]),
+        "log_path": os.path.abspath(outputs["log"]),
+        "split_manifest": os.path.abspath(outputs["split_manifest"]),
+    }
+    summary_path = outputs.get("training_summary")
+    if summary_path is not None:
+        _write_training_summary(
+            summary_path,
+            summary_config,
+            stage="start",
+            runtime_metadata=summary_runtime,
+            cli_args=vars(args),
+        )
     if len(gpu_ids) > 1:
         mp.spawn(
             _distributed_worker,

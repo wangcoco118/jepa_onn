@@ -119,6 +119,99 @@ def _configure_inference_logging(output_dir):
     return log_path
 
 
+_RESUME_CHECKPOINT_VERSION = 1
+
+
+def _normalize_resume_context_lengths(context_lengths):
+    if isinstance(context_lengths, (list, tuple)):
+        return tuple(int(value) for value in context_lengths)
+    return (int(context_lengths),)
+
+
+def _resume_metadata(frame_step, context_lengths, batch_size, predictor_checkpoint):
+    return {
+        "resume_version": _RESUME_CHECKPOINT_VERSION,
+        "frame_step": int(frame_step),
+        "context_lengths": _normalize_resume_context_lengths(context_lengths),
+        "batch_size": int(batch_size),
+        "predictor_checkpoint": (
+            os.path.abspath(os.fspath(predictor_checkpoint))
+            if predictor_checkpoint is not None
+            else None
+        ),
+    }
+
+
+def _save_resume_checkpoint(
+    path,
+    *,
+    next_batch,
+    frame_step,
+    context_lengths,
+    batch_size,
+    predictor_checkpoint,
+    all_losses,
+    all_tasks,
+):
+    path = os.path.abspath(os.fspath(path))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    state = _resume_metadata(
+        frame_step,
+        context_lengths,
+        batch_size,
+        predictor_checkpoint,
+    )
+    state.update(
+        {
+            "next_batch": int(next_batch),
+            "all_losses": [
+                value.detach().cpu() if torch.is_tensor(value) else value
+                for value in all_losses
+            ],
+            "all_tasks": [
+                value.detach().cpu() if torch.is_tensor(value) else value
+                for value in all_tasks
+            ],
+        }
+    )
+    temporary_path = f"{path}.tmp"
+    torch.save(state, temporary_path)
+    os.replace(temporary_path, path)
+
+
+def _load_resume_checkpoint(
+    path,
+    *,
+    frame_step,
+    context_lengths,
+    batch_size,
+    predictor_checkpoint,
+):
+    if not path or not os.path.exists(path):
+        return None
+    path = os.path.abspath(os.fspath(path))
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    expected = _resume_metadata(
+        frame_step,
+        context_lengths,
+        batch_size,
+        predictor_checkpoint,
+    )
+    for key, expected_value in expected.items():
+        actual_value = state.get(key)
+        if key == "context_lengths" and actual_value is not None:
+            actual_value = _normalize_resume_context_lengths(actual_value)
+        if actual_value != expected_value:
+            raise ValueError(
+                f"resume checkpoint metadata mismatch for {key}: "
+                f"expected {expected_value!r}, got {actual_value!r}"
+            )
+    next_batch = int(state.get("next_batch", -1))
+    if next_batch < 0:
+        raise ValueError("resume checkpoint next_batch must be non-negative")
+    return state
+
+
 def _format_batch_progress(
     *,
     batch_index,
@@ -203,6 +296,20 @@ def main(args_eval, resume_preempt=False):
     mae_decoder_blocks = args_eval.get('mae_decoder_blocks', -1)
     normalize_targets =args_eval.get('normalize_targets',True)
     last_context_copy_baseline = _last_context_copy_enabled(args_eval)
+    resume_config = args_eval.get("test_resume") or {}
+    if not isinstance(resume_config, dict):
+        raise TypeError("test_resume must be a mapping")
+    resume_enabled = resume_config.get("enabled", False)
+    if not isinstance(resume_enabled, bool):
+        raise TypeError("test_resume.enabled must be a boolean")
+    resume_checkpoint_path = resume_config.get("checkpoint_path")
+    resume_every_batches = int(resume_config.get("save_every_batches", 20))
+    if resume_every_batches <= 0:
+        raise ValueError("test_resume.save_every_batches must be positive")
+    if resume_enabled and not resume_checkpoint_path:
+        raise ValueError(
+            "test_resume.checkpoint_path is required when resume is enabled"
+        )
     # ----------------------------------------------------------------------- #
 
     try:
@@ -334,7 +441,12 @@ def main(args_eval, resume_preempt=False):
                 resolution=resolution,
                 normalize_targets=normalize_targets,
                 last_context_copy_baseline=last_context_copy_baseline,
-                log_progress=(rank == 0))
+                log_progress=(rank == 0),
+                resume_checkpoint_path=(
+                    resume_checkpoint_path if resume_enabled else None
+                ),
+                resume_every_batches=resume_every_batches,
+                resume_predictor_checkpoint=predictor_checkpoint)
             
             all_losses = batch_all_gather(all_losses).cpu()
             all_labels = batch_all_gather(all_labels).cpu().numpy().astype(int)
@@ -396,6 +508,9 @@ def extract_losses(
     normalize_targets=True,
     last_context_copy_baseline=False,
     log_progress=True,
+    resume_checkpoint_path=None,
+    resume_every_batches=20,
+    resume_predictor_checkpoint=None,
 ):
     print(context_lengths)
 
@@ -427,6 +542,37 @@ def extract_losses(
 
     all_tasks = []
     all_losses = []
+    start_batch = 0
+    if resume_checkpoint_path:
+        resume_every_batches = int(resume_every_batches)
+        if resume_every_batches <= 0:
+            raise ValueError("resume_every_batches must be positive")
+        resume_state = _load_resume_checkpoint(
+            resume_checkpoint_path,
+            frame_step=frame_step,
+            context_lengths=context_lengths,
+            batch_size=batch_size,
+            predictor_checkpoint=resume_predictor_checkpoint,
+        )
+        if resume_state is not None:
+            start_batch = int(resume_state["next_batch"])
+            if start_batch > total_batches:
+                raise ValueError(
+                    "resume checkpoint next_batch exceeds available batches"
+                )
+            all_losses = [
+                value.to(device) if torch.is_tensor(value) else value
+                for value in resume_state.get("all_losses", [])
+            ]
+            all_tasks = list(resume_state.get("all_tasks", []))
+            if log_progress:
+                logger.info(
+                    "resume_loaded frame_step=%d next_batch=%d/%d checkpoint=%s",
+                    frame_step,
+                    start_batch,
+                    total_batches,
+                    resume_checkpoint_path,
+                )
     processed = 0
     failures = 0
     if log_progress:
@@ -440,6 +586,8 @@ def extract_losses(
     for i in range(total_batches):
         data_read_started = time.perf_counter()
         udata = next(loader)
+        if i < start_batch:
+            continue
 
         tasks = udata[1]
 
@@ -559,6 +707,20 @@ def extract_losses(
         # i.e. all_losses[all_labels == 0] and 1 are matched pairwise
         all_losses.append(losses)
         all_tasks.append(tasks)
+        if (
+            resume_checkpoint_path
+            and (i + 1) % resume_every_batches == 0
+        ):
+            _save_resume_checkpoint(
+                resume_checkpoint_path,
+                next_batch=i + 1,
+                frame_step=frame_step,
+                context_lengths=context_lengths,
+                batch_size=batch_size,
+                predictor_checkpoint=resume_predictor_checkpoint,
+                all_losses=all_losses,
+                all_tasks=all_tasks,
+            )
         if log_progress:
             task_indices = tasks.detach().cpu().flatten().numpy().astype(int)
             movie_paths = [data.dataset.tasks[index] for index in task_indices]

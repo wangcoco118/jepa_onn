@@ -1,0 +1,20 @@
+O1_visible_relative: 0.062037037037037036
+O1_visible_absolute: 0.3275587277091907
+O1_occluded_relative: 0.4203703703703704
+O1_occluded_absolute: 0.49260416666666673
+O1_all_relative: 0.2412037037037037
+O1_all_absolute: 0.4277031893004115
+
+O2_visible_relative: 0.20277777777777778
+O2_visible_absolute: 0.40327074759945125
+O2_occluded_relative: 0.425
+O2_occluded_absolute: 0.4953746570644719
+O2_all_relative: 0.3138888888888889
+O2_all_absolute: 0.460420310356653
+
+O3_visible_relative: 0.09074074074074075
+O3_visible_absolute: 0.3873658264746227
+O3_occluded_relative: 0.4740740740740741
+O3_occluded_absolute: 0.494048353909465
+O3_all_relative: 0.2824074074074074
+O3_all_absolute: 0.44350480109739365

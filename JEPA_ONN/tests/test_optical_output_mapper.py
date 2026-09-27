@@ -110,5 +110,36 @@ class OpticalOutputMapperTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(mapper.slm_layers[1].phase_logits.grad).all())
 
 
+    def test_optical_slm1_feedback_training_yaml_contract(self):
+        import yaml
+
+        config_path = (
+            "evals/intuitive_physics/configs/"
+            "onn_feedback_optical_slm1_feedback_slm1_25ep_bs15.yaml"
+        )
+        with open(config_path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+
+        self.assertEqual(config["data"]["batch_size"], 15)
+        self.assertEqual(config["training"]["epochs"], 25)
+        self.assertEqual(config["predictor"]["output_mode"], "optical")
+        self.assertEqual(
+            config["predictor"]["optical_output"]["num_slm_layers"],
+            2,
+        )
+        self.assertEqual(
+            config["predictor"]["optical_output"]["slm_intervals_um"],
+            [8000.0],
+        )
+
+        onn = config["onn"]
+        self.assertEqual(onn["num_slm_layers"], 1)
+        self.assertTrue(onn["feedback_enabled"])
+        self.assertEqual(onn["feedback_layer_mode"], "single")
+        self.assertEqual(onn["feedback_layer_index"], 0)
+        self.assertEqual(onn["feedback_gain_init"], 0.33)
+        self.assertEqual(onn["slm_intervals_um"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
