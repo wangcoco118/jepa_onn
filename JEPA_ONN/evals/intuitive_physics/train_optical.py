@@ -526,10 +526,16 @@ def _format_jepa_batch_log(
     loss,
     grad_norm,
     time_s,
+    context_lengths=None,
 ):
+    context_field = (
+        ""
+        if context_lengths is None
+        else f"context_lengths={list(context_lengths)} "
+    )
     return (
         f"epoch={int(epoch)} stage={stage} mask_mode={mask_mode} "
-        f"{_format_progress(step, total_steps)} "
+        f"{context_field}{_format_progress(step, total_steps)} "
         f"batch={int(batch_size)} n_ctxt={n_ctxt} n_tgt={n_tgt} "
         f"covered_count={covered_count} missing_count={missing_count} "
         f"loss={float(loss):.6f} grad_norm={float(grad_norm):.3f} "
@@ -593,7 +599,12 @@ def _load_config(path):
 
 
 def _apply_cli_overrides(
-    config, batch_size=None, target_node=None, mask_mode=None, feedback_enabled=None
+    config,
+    batch_size=None,
+    target_node=None,
+    mask_mode=None,
+    feedback_enabled=None,
+    checkpoint_selection=None,
 ):
     if batch_size is not None:
         if batch_size <= 0:
@@ -602,7 +613,10 @@ def _apply_cli_overrides(
     if target_node is not None:
         config.setdefault("distillation", {})["target_node"] = target_node
     if mask_mode is not None:
-        config["mask_mode"] = normalize_mask_mode(mask_mode)
+        if str(mask_mode).strip().lower() == "causal_prefix":
+            config["mask_mode"] = "causal_prefix"
+        else:
+            config["mask_mode"] = normalize_mask_mode(mask_mode)
     if feedback_enabled is not None:
         onn_config = config.setdefault("onn", config.get("onn_feedback", {}))
         onn_config["feedback_enabled"] = bool(feedback_enabled)
@@ -610,13 +624,33 @@ def _apply_cli_overrides(
             # A disabled physical feedback path must not retain an unused
             # memory state; this also satisfies ONNConfig's invariant.
             onn_config["feedback_memory_enabled"] = False
+    if checkpoint_selection is not None:
+        config.setdefault("training", {})["checkpoint_selection"] = (
+            checkpoint_selection
+        )
     return config
 
 
 def _resolve_mask_mode(args_eval):
     training_cfg = args_eval.get("training", {})
     configured = args_eval.get("mask_mode", training_cfg.get("mask_mode"))
+    if str(configured).strip().lower() == "causal_prefix":
+        return "causal_prefix"
     return normalize_mask_mode(configured)
+
+
+def _resolve_checkpoint_selection(args_eval):
+    selection = str(
+        args_eval.get("training", {}).get(
+            "checkpoint_selection", "validation_best"
+        )
+    ).strip().lower()
+    if selection not in {"validation_best", "last_epoch"}:
+        raise ValueError(
+            "training.checkpoint_selection must be validation_best or "
+            f"last_epoch, got {selection!r}"
+        )
+    return selection
 
 
 def _resolve_experiment_mode(args_eval):
@@ -1167,11 +1201,58 @@ def _default_jepa_mask_config():
     ]
 
 
+def _causal_context_lengths(args_eval):
+    return list(
+        args_eval.get("training", {}).get(
+            "causal_context_lengths", [4, 6, 8, 10, 12]
+        )
+    )
+
+
+def _select_causal_context_lengths(args_eval, training, global_step):
+    context_lengths = _causal_context_lengths(args_eval)
+    if not training:
+        return context_lengths
+    return [context_lengths[int(global_step) % len(context_lengths)]]
+
+
+def _make_causal_prefix_masks(
+    args_eval, context_lengths, batch_size, device
+):
+    data_cfg = args_eval["data"]
+    pretrain_cfg = args_eval["pretrain"]
+    patch_size = int(pretrain_cfg.get("patch_size", 16))
+    tubelet_size = int(pretrain_cfg.get("tubelet_size", 2))
+    resolution = int(data_cfg.get("resolution", 224))
+    frames_per_clip = int(data_cfg.get("frames_per_clip", 16))
+    masks_ctxt = []
+    masks_tgt = []
+    for context_length in context_lengths:
+        context, target, _ = get_time_masks(
+            context_length,
+            spatial_size=(patch_size, patch_size),
+            temporal_size=tubelet_size,
+            spatial_dim=(resolution, resolution),
+            temporal_dim=frames_per_clip,
+            as_bool=False,
+        )
+        masks_ctxt.append(
+            context.unsqueeze(0).repeat(batch_size, 1).to(device)
+        )
+        masks_tgt.append(
+            target.unsqueeze(0).repeat(batch_size, 1).to(device)
+        )
+    return masks_ctxt, masks_tgt
+
+
 def _make_jepa_mask_collator(args_eval):
+    mask_mode = _resolve_mask_mode(args_eval)
+    if mask_mode == "causal_prefix":
+        return None
     data_cfg = args_eval["data"]
     pretrain_cfg = args_eval["pretrain"]
     return make_mask_collator(
-        mask_mode=_resolve_mask_mode(args_eval),
+        mask_mode=mask_mode,
         cfgs_mask=args_eval.get("mask") or _default_jepa_mask_config(),
         crop_size=(
             int(data_cfg.get("resolution", 224)),
@@ -1226,6 +1307,30 @@ def _make_jepa_loader(
     )[0]
 
 
+def _make_jepa_loaders(
+    args_eval, split, checkpoint_selection, world_size=1, rank=0
+):
+    train_loader = _make_jepa_loader(
+        args_eval,
+        split["train_video_ids"],
+        deterministic=False,
+        collator=_make_jepa_mask_collator(args_eval),
+        world_size=world_size,
+        rank=rank,
+    )
+    val_loader = None
+    if checkpoint_selection == "validation_best":
+        val_loader = _make_jepa_loader(
+            args_eval,
+            split["val_video_ids"],
+            deterministic=True,
+            collator=_make_jepa_mask_collator(args_eval),
+            world_size=world_size,
+            rank=rank,
+        )
+    return train_loader, val_loader
+
+
 def _extract_jepa_clips(batch, device):
     payload = batch[0]
     if isinstance(payload, (tuple, list)):
@@ -1250,9 +1355,23 @@ def _move_masks(masks, device):
     return [mask.to(device=device, dtype=torch.long) for mask in masks]
 
 
-def _prepare_jepa_batch(batch, args_eval, encoder, target_encoder, device):
+def _prepare_jepa_batch(
+    batch,
+    args_eval,
+    encoder,
+    target_encoder,
+    device,
+    selected_context_lengths=None,
+):
     clips = _extract_jepa_clips(batch, device)
-    if len(batch) == 3:
+    if selected_context_lengths is not None:
+        masks_ctxt, masks_tgt = _make_causal_prefix_masks(
+            args_eval,
+            selected_context_lengths,
+            batch_size=clips.shape[0],
+            device=device,
+        )
+    elif len(batch) == 3:
         masks_ctxt = _move_masks(batch[1], device)
         masks_tgt = _move_masks(batch[2], device)
     else:
@@ -1399,6 +1518,7 @@ def _run_jepa_epoch(
     clip_grad=10.0,
     rank=0,
     world_size=1,
+    global_step_start=0,
 ):
     stage = "train" if training else "val"
     sampler = getattr(loader, "sampler", None)
@@ -1418,8 +1538,20 @@ def _run_jepa_epoch(
             break
         step_started = time.perf_counter()
         feature_started = time.perf_counter()
+        selected_context_lengths = None
+        if _resolve_mask_mode(args_eval) == "causal_prefix":
+            selected_context_lengths = _select_causal_context_lengths(
+                args_eval,
+                training=training,
+                global_step=int(global_step_start) + batch_index,
+            )
         clips, context, targets, masks_ctxt, masks_tgt = _prepare_jepa_batch(
-            batch, args_eval, encoder, target_encoder, device
+            batch,
+            args_eval,
+            encoder,
+            target_encoder,
+            device,
+            selected_context_lengths=selected_context_lengths,
         )
         targets = vit_pred.project_targets_for_loss(predictor, targets)
         _sync_for_timing(device)
@@ -1475,6 +1607,7 @@ def _run_jepa_epoch(
                     loss=loss_value,
                     grad_norm=grad_norm,
                     time_s=time.perf_counter() - step_started,
+                    context_lengths=selected_context_lengths,
                 )
             )
     if world_size > 1:
@@ -1543,7 +1676,11 @@ def _end_to_end_checkpoint(
         "epoch": int(epoch),
         "global_step": int(global_step),
         "best_epoch": int(epoch if kind == "best" else (best_epoch or epoch)),
-        "best_val_jepa_loss": float(best_val_loss),
+        "selected_epoch": int(best_epoch or epoch),
+        "checkpoint_selection": _resolve_checkpoint_selection(args_eval),
+        "best_val_jepa_loss": (
+            None if best_val_loss is None else float(best_val_loss)
+        ),
         "predictor": predictor_state,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
@@ -2076,31 +2213,26 @@ def run_end_to_end_jepa(
         target_encoder_trainable,
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    train_loader = _make_jepa_loader(
+    checkpoint_selection = _resolve_checkpoint_selection(args_eval)
+    validation_enabled = checkpoint_selection == "validation_best"
+    train_loader, val_loader = _make_jepa_loaders(
         args_eval,
-        split["train_video_ids"],
-        deterministic=False,
-        collator=_make_jepa_mask_collator(args_eval),
-        world_size=world_size,
-        rank=rank,
-    )
-    val_loader = _make_jepa_loader(
-        args_eval,
-        split["val_video_ids"],
-        deterministic=True,
-        collator=_make_jepa_mask_collator(args_eval),
+        split,
+        checkpoint_selection,
         world_size=world_size,
         rank=rank,
     )
     logger.info(
-        "data_loaders_ready experiment_mode=%s batch_size=%s train_batches=%d "
-        "val_batches=%d clip_shape=[B,3,16,H,W]",
+        "data_loaders_ready experiment_mode=%s checkpoint_selection=%s "
+        "batch_size=%s train_batches=%d val_batches=%s "
+        "clip_shape=[B,3,16,H,W]",
         experiment_mode,
+        checkpoint_selection,
         args_eval["data"].get("batch_size", 1),
         len(train_loader),
-        len(val_loader),
+        len(val_loader) if val_loader is not None else "disabled",
     )
-    best_val_loss = float("inf")
+    best_val_loss = float("inf") if validation_enabled else None
     best_epoch = 0
     global_step = 0
     start_epoch = 1
@@ -2117,13 +2249,16 @@ def run_end_to_end_jepa(
         previous_split = resumed.get("data_split")
         if previous_split is not None and previous_split != split:
             raise ValueError("resume checkpoint split does not match current split manifest")
-        best_val_loss = float(resumed.get("best_val_jepa_loss", float("inf")))
+        if validation_enabled:
+            best_val_loss = float(
+                resumed.get("best_val_jepa_loss", float("inf"))
+            )
         best_epoch = int(resumed.get("best_epoch", resumed.get("epoch", 0)))
         global_step = int(resumed.get("global_step", 0))
         start_epoch = int(resumed.get("epoch", 0)) + 1
     best_checkpoint = None
     clip_grad = float(training_cfg.get("clip_grad", 10.0))
-    if resume_checkpoint is None:
+    if resume_checkpoint is None and validation_enabled:
         initial_val_metrics = _run_jepa_epoch(
             val_loader,
             args_eval,
@@ -2169,6 +2304,7 @@ def run_end_to_end_jepa(
             best_val_loss,
             os.path.abspath(output_path),
         )
+    last_completed_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs + 1):
         train_metrics = _run_jepa_epoch(
             train_loader,
@@ -2185,26 +2321,32 @@ def run_end_to_end_jepa(
             clip_grad=clip_grad,
             rank=rank,
             world_size=world_size,
+            global_step_start=global_step,
         )
         global_step += train_metrics["batches"]
-        val_metrics = _run_jepa_epoch(
-            val_loader,
-            args_eval,
-            encoder,
-            target_encoder,
-            predictor,
-            optimizer,
-            device,
-            logger,
-            epoch,
-            training=False,
-            max_steps=max_steps,
-            clip_grad=clip_grad,
-            rank=rank,
-            world_size=world_size,
-        )
+        last_completed_epoch = epoch
+        val_metrics = None
+        improved = False
+        if validation_enabled:
+            val_metrics = _run_jepa_epoch(
+                val_loader,
+                args_eval,
+                encoder,
+                target_encoder,
+                predictor,
+                optimizer,
+                device,
+                logger,
+                epoch,
+                training=False,
+                max_steps=max_steps,
+                clip_grad=clip_grad,
+                rank=rank,
+                world_size=world_size,
+                global_step_start=global_step,
+            )
+            improved = val_metrics["jepa_loss"] < best_val_loss
         scheduler.step()
-        improved = val_metrics["jepa_loss"] < best_val_loss
         if improved:
             best_val_loss = val_metrics["jepa_loss"]
             best_epoch = epoch
@@ -2235,6 +2377,8 @@ def run_end_to_end_jepa(
                 best_val_loss,
                 os.path.abspath(output_path),
             )
+        if not validation_enabled:
+            best_epoch = epoch
         last_checkpoint = _end_to_end_checkpoint(
             predictor,
             optimizer,
@@ -2263,17 +2407,57 @@ def run_end_to_end_jepa(
                     epoch,
                     _format_feedback_metadata(feedback_metadata),
                 )
+        if validation_enabled:
+            logger.info(
+                "epoch_done experiment_mode=%s epoch=%d "
+                "train_jepa_loss=%.6f val_jepa_loss=%.6f "
+                "best_val_jepa_loss=%.6f improved=%s elapsed_s=%.3f",
+                experiment_mode,
+                epoch,
+                train_metrics["jepa_loss"],
+                val_metrics["jepa_loss"],
+                best_val_loss,
+                improved,
+                time.perf_counter() - run_started,
+            )
+        else:
+            logger.info(
+                "epoch_done experiment_mode=%s epoch=%d "
+                "train_jepa_loss=%.6f validation=disabled "
+                "checkpoint_selection=last_epoch elapsed_s=%.3f",
+                experiment_mode,
+                epoch,
+                train_metrics["jepa_loss"],
+                time.perf_counter() - run_started,
+            )
+    if not validation_enabled:
+        best_epoch = last_completed_epoch
+        best_checkpoint = _end_to_end_checkpoint(
+            predictor,
+            optimizer,
+            scheduler,
+            best_epoch,
+            global_step,
+            None,
+            split,
+            split_manifest,
+            args_eval,
+            "best",
+            best_epoch=best_epoch,
+            experiment_mode=experiment_mode,
+            world_size=world_size,
+            gpu_ids=gpu_ids,
+        )
+        if rank == 0:
+            _save_checkpoint(best_checkpoint, output_path)
+        if world_size > 1:
+            dist.barrier()
         logger.info(
-            "epoch_done experiment_mode=%s epoch=%d train_jepa_loss=%.6f "
-            "val_jepa_loss=%.6f best_val_jepa_loss=%.6f improved=%s "
-            "elapsed_s=%.3f",
+            "selected_checkpoint_saved experiment_mode=%s epoch=%d "
+            "checkpoint_selection=last_epoch path=%s",
             experiment_mode,
-            epoch,
-            train_metrics["jepa_loss"],
-            val_metrics["jepa_loss"],
-            best_val_loss,
-            improved,
-            time.perf_counter() - run_started,
+            best_epoch,
+            os.path.abspath(output_path),
         )
     if rank == 0:
         if best_checkpoint is None:
@@ -2288,6 +2472,8 @@ def run_end_to_end_jepa(
             args_eval,
             stage="complete",
             results={
+                "checkpoint_selection": checkpoint_selection,
+                "selected_epoch": best_epoch,
                 "best_epoch": best_epoch,
                 "best_val_jepa_loss": best_val_loss,
                 "last_train_jepa_loss": (
@@ -2297,7 +2483,7 @@ def run_end_to_end_jepa(
                 ),
                 "last_val_jepa_loss": (
                     val_metrics["jepa_loss"]
-                    if "val_metrics" in locals()
+                    if "val_metrics" in locals() and val_metrics is not None
                     else None
                 ),
                 "global_step": global_step,
@@ -2306,19 +2492,35 @@ def run_end_to_end_jepa(
                 "last_checkpoint": os.path.abspath(last_output),
             },
         )
-        logger.info(
-            "run_done experiment_mode=%s world_size=%d gpu_ids=%s best_epoch=%d "
-            "best_val_jepa_loss=%.6f best=%s last=%s "
-            "final_checkpoint=disabled elapsed_s=%.3f",
-            experiment_mode,
-            world_size,
-            gpu_ids,
-            best_epoch,
-            best_val_loss,
-            os.path.abspath(output_path),
-            os.path.abspath(last_output),
-            time.perf_counter() - run_started,
-        )
+        if validation_enabled:
+            logger.info(
+                "run_done experiment_mode=%s world_size=%d gpu_ids=%s "
+                "checkpoint_selection=validation_best best_epoch=%d "
+                "best_val_jepa_loss=%.6f best=%s last=%s "
+                "final_checkpoint=disabled elapsed_s=%.3f",
+                experiment_mode,
+                world_size,
+                gpu_ids,
+                best_epoch,
+                best_val_loss,
+                os.path.abspath(output_path),
+                os.path.abspath(last_output),
+                time.perf_counter() - run_started,
+            )
+        else:
+            logger.info(
+                "run_done experiment_mode=%s world_size=%d gpu_ids=%s "
+                "checkpoint_selection=last_epoch selected_epoch=%d "
+                "best_val_jepa_loss=disabled best=%s last=%s "
+                "final_checkpoint=disabled elapsed_s=%.3f",
+                experiment_mode,
+                world_size,
+                gpu_ids,
+                best_epoch,
+                os.path.abspath(output_path),
+                os.path.abspath(last_output),
+                time.perf_counter() - run_started,
+            )
 
     if world_size > 1:
         dist.barrier()
@@ -2472,9 +2674,18 @@ def main():
     )
     parser.add_argument(
         "--mask-mode",
-        choices=("unified_random", "classic_random"),
+        choices=("unified_random", "classic_random", "causal_prefix"),
         default=None,
         help="override the configured mask generation mode",
+    )
+    parser.add_argument(
+        "--checkpoint-selection",
+        choices=("validation_best", "last_epoch"),
+        default=None,
+        help=(
+            "select by validation loss, or skip validation and select the "
+            "last epoch"
+        ),
     )
     parser.add_argument(
         "--target-node",
@@ -2502,6 +2713,7 @@ def main():
         feedback_enabled=(
             None if args.feedback_enabled is None else args.feedback_enabled == "true"
         ),
+        checkpoint_selection=args.checkpoint_selection,
     )
     outputs = _resolve_run_outputs(args.output)
     training_cfg = config.setdefault("training", {})

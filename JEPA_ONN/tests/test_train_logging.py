@@ -74,6 +74,26 @@ class TrainLoggingTests(unittest.TestCase):
             self.assertNotIn(repeated_field, message)
 
 
+    def test_causal_batch_log_records_selected_context_lengths(self):
+        message = _format_jepa_batch_log(
+            epoch=1,
+            stage="train",
+            step=1,
+            total_steps=2,
+            mask_mode="causal_prefix",
+            batch_size=2,
+            n_ctxt=392,
+            n_tgt=1176,
+            covered_count=1568,
+            missing_count=0,
+            loss=0.5,
+            grad_norm=1.0,
+            time_s=1.0,
+            context_lengths=[4],
+        )
+        self.assertIn("context_lengths=[4]", message)
+
+
     def test_optical_output_metadata_is_logged_separately_from_feedback(self):
         config = ONNConfig.from_mapping(
             {

@@ -14,6 +14,7 @@ from evals.intuitive_physics.intphys_dataset import IntPhysDataset
 from evals.intuitive_physics import eval as dev_eval
 from evals.intuitive_physics.train_optical import (
     _apply_cli_overrides,
+    _causal_context_lengths,
     _compute_jepa_loss,
     _compute_distillation_loss,
     _end_to_end_checkpoint,
@@ -23,10 +24,16 @@ from evals.intuitive_physics.train_optical import (
     _extract_jepa_clips,
     _last_checkpoint_path,
     _load_end_to_end_checkpoint,
+    _make_causal_prefix_masks,
     _make_jepa_loader,
+    _make_jepa_loaders,
+    _make_jepa_mask_collator,
     _save_checkpoint,
     _require_existing_video_split,
+    _resolve_checkpoint_selection,
     _resolve_gpu_ids,
+    _run_jepa_epoch,
+    _select_causal_context_lengths,
     _set_predictor_trainability,
 )
 from evals.intuitive_physics.optical_split import (
@@ -181,6 +188,47 @@ class MultiGpuEntrypointTests(unittest.TestCase):
         self.assertEqual(spawn.call_args.kwargs["args"][-1], [0, 2])
 
 
+class TrainingModeCliTests(unittest.TestCase):
+    def test_cli_accepts_causal_prefix_and_last_epoch_selection(self):
+        from evals.intuitive_physics import train_optical
+
+        outputs = {
+            "run_dir": Path("/data/linux/wkx/IntPhys/onn_run"),
+            "output": Path("/data/linux/wkx/IntPhys/onn_run/model.pt"),
+            "last_output": Path("/data/linux/wkx/IntPhys/onn_run/model.last.pt"),
+            "final_output": Path("/data/linux/wkx/IntPhys/onn_run/model.final.pt"),
+            "log": Path("/data/linux/wkx/IntPhys/onn_run/train.log"),
+            "split_manifest": Path("/data/linux/wkx/IntPhys/onn_run/split.json"),
+        }
+        argv = [
+            "train_optical.py",
+            "--config",
+            "onn.yaml",
+            "--output",
+            "causal_train",
+            "--mask-mode",
+            "causal_prefix",
+            "--checkpoint-selection",
+            "last_epoch",
+        ]
+        with patch.object(
+            train_optical,
+            "_load_config",
+            return_value={"training": {"experiment_mode": "onn_feedback"}},
+        ), patch.object(
+            train_optical, "_resolve_run_outputs", return_value=outputs
+        ), patch.object(
+            train_optical, "_run_selected_mode"
+        ) as run_selected, patch.object(sys, "argv", argv):
+            train_optical.main()
+
+        config = run_selected.call_args.args[0]
+        self.assertEqual(config["mask_mode"], "causal_prefix")
+        self.assertEqual(
+            config["training"]["checkpoint_selection"], "last_epoch"
+        )
+
+
 class EntrypointSplitManifestTests(unittest.TestCase):
     def _run_main(self, extra_args):
         from evals.intuitive_physics import train_optical
@@ -311,6 +359,17 @@ class CliOverrideTests(unittest.TestCase):
         updated = _apply_cli_overrides(config, feedback_enabled=True)
         self.assertTrue(updated["onn"]["feedback_enabled"])
         self.assertFalse(updated["onn"]["feedback_memory_enabled"])
+
+    def test_training_mode_cli_overrides_are_stored_in_config(self):
+        updated = _apply_cli_overrides(
+            {},
+            mask_mode="causal_prefix",
+            checkpoint_selection="last_epoch",
+        )
+        self.assertEqual(updated["mask_mode"], "causal_prefix")
+        self.assertEqual(
+            updated["training"]["checkpoint_selection"], "last_epoch"
+        )
 
 
 class WarningCleanupTests(unittest.TestCase):
@@ -615,6 +674,320 @@ class RealtimeDistillationConfigTests(unittest.TestCase):
         self.assertTrue(torch.allclose(nmse, torch.tensor(2.0)))
         self.assertTrue(torch.allclose(cosine, torch.tensor(1.0)))
         self.assertTrue(torch.allclose(total, torch.tensor(2.1)))
+
+
+class CausalPrefixMaskTests(unittest.TestCase):
+    def _config(self, context_lengths=None):
+        return {
+            "mask_mode": "causal_prefix",
+            "data": {
+                "resolution": 224,
+                "frames_per_clip": 16,
+            },
+            "pretrain": {"patch_size": 16, "tubelet_size": 2},
+            "training": {
+                "causal_context_lengths": (
+                    [4, 6, 8, 10, 12]
+                    if context_lengths is None
+                    else context_lengths
+                )
+            },
+        }
+
+    def test_causal_prefix_masks_cover_prefix_and_future_suffix(self):
+        config = self._config()
+        masks_ctxt, masks_tgt = _make_causal_prefix_masks(
+            config,
+            [4, 6, 8, 10, 12],
+            batch_size=2,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(
+            [mask.shape[1] for mask in masks_ctxt],
+            [392, 588, 784, 980, 1176],
+        )
+        self.assertEqual(
+            [mask.shape[1] for mask in masks_tgt],
+            [1176, 980, 784, 588, 392],
+        )
+        for context, target in zip(masks_ctxt, masks_tgt):
+            self.assertTrue(torch.equal(context[0], context[1]))
+            self.assertTrue(torch.equal(target[0], target[1]))
+            self.assertTrue(
+                torch.equal(
+                    torch.cat((context[0], target[0])),
+                    torch.arange(1568),
+                )
+            )
+
+    def test_causal_context_order_is_used_without_reordering_or_deduplication(self):
+        config = self._config([10, 4, 10])
+        self.assertEqual(_causal_context_lengths(config), [10, 4, 10])
+        self.assertEqual(
+            [
+                _select_causal_context_lengths(
+                    config, training=True, global_step=step
+                )
+                for step in range(4)
+            ],
+            [[10], [4], [10], [10]],
+        )
+        self.assertEqual(
+            _select_causal_context_lengths(
+                config, training=False, global_step=99
+            ),
+            [10, 4, 10],
+        )
+
+    def test_causal_prefix_uses_no_random_mask_collator(self):
+        self.assertIsNone(_make_jepa_mask_collator(self._config()))
+
+
+class CausalEpochScheduleTests(unittest.TestCase):
+    def _config(self):
+        return {
+            "mask_mode": "causal_prefix",
+            "training": {
+                "causal_context_lengths": [4, 6, 8, 10, 12]
+            },
+            "loss": {"loss_exp": 1.0},
+        }
+
+    def _run(self, training, global_step_start, batches):
+        from evals.intuitive_physics import train_optical
+
+        selected = []
+
+        def prepare(
+            batch, args_eval, encoder, target_encoder, device,
+            selected_context_lengths=None,
+        ):
+            selected.append(selected_context_lengths)
+            clips = torch.zeros(1, 3, 16, 1, 1)
+            context = [torch.zeros(1, 1, 1)]
+            targets = [torch.ones(1, 1, 1)]
+            masks = [torch.zeros(1, 1, dtype=torch.long)]
+            return clips, context, targets, masks, masks
+
+        class TinyPredictor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(0.0))
+
+            def forward(self, context, targets, masks_ctxt, masks_tgt):
+                return [targets[0] + self.weight]
+
+        predictor = TinyPredictor()
+        optimizer = torch.optim.SGD(predictor.parameters(), lr=0.1)
+        with patch.object(
+            train_optical, "_prepare_jepa_batch", side_effect=prepare
+        ):
+            _run_jepa_epoch(
+                [object()] * batches,
+                self._config(),
+                torch.nn.Identity(),
+                torch.nn.Identity(),
+                predictor,
+                optimizer,
+                torch.device("cpu"),
+                unittest.mock.Mock(),
+                epoch=1,
+                training=training,
+                global_step_start=global_step_start,
+            )
+        return selected
+
+    def test_training_schedule_continues_from_global_step(self):
+        self.assertEqual(
+            self._run(training=True, global_step_start=3, batches=3),
+            [[10], [12], [4]],
+        )
+
+    def test_validation_uses_all_causal_context_lengths(self):
+        self.assertEqual(
+            self._run(training=False, global_step_start=99, batches=1),
+            [[4, 6, 8, 10, 12]],
+        )
+
+
+class CheckpointSelectionModeTests(unittest.TestCase):
+    def test_checkpoint_selection_defaults_to_validation_best(self):
+        self.assertEqual(
+            _resolve_checkpoint_selection({}), "validation_best"
+        )
+        self.assertEqual(
+            _resolve_checkpoint_selection(
+                {"training": {"checkpoint_selection": "last_epoch"}}
+            ),
+            "last_epoch",
+        )
+
+    def test_last_epoch_mode_does_not_build_validation_loader(self):
+        from evals.intuitive_physics import train_optical
+
+        config = {
+            "mask_mode": "causal_prefix",
+            "data": {"frames_per_clip": 16},
+            "pretrain": {},
+        }
+        split = {
+            "train_video_ids": ["train"],
+            "val_video_ids": ["val"],
+        }
+        loaders = [object(), object()]
+        with patch.object(
+            train_optical, "_make_jepa_loader", side_effect=loaders
+        ) as make_loader:
+            train_loader, val_loader = _make_jepa_loaders(
+                config, split, "last_epoch", world_size=1, rank=0
+            )
+
+        self.assertIs(train_loader, loaders[0])
+        self.assertIsNone(val_loader)
+        self.assertEqual(make_loader.call_count, 1)
+
+    def test_validation_best_mode_builds_both_loaders(self):
+        from evals.intuitive_physics import train_optical
+
+        config = {
+            "mask_mode": "causal_prefix",
+            "data": {"frames_per_clip": 16},
+            "pretrain": {},
+        }
+        split = {
+            "train_video_ids": ["train"],
+            "val_video_ids": ["val"],
+        }
+        loaders = [object(), object()]
+        with patch.object(
+            train_optical, "_make_jepa_loader", side_effect=loaders
+        ) as make_loader:
+            train_loader, val_loader = _make_jepa_loaders(
+                config, split, "validation_best", world_size=1, rank=0
+            )
+
+        self.assertIs(train_loader, loaders[0])
+        self.assertIs(val_loader, loaders[1])
+        self.assertEqual(make_loader.call_count, 2)
+
+    def test_last_epoch_checkpoint_has_no_validation_metric(self):
+        predictor = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(predictor.parameters(), lr=1e-3)
+        config = {
+            "pretrain": {"folder": "/checkpoint", "checkpoint": "official.pt"},
+            "training": {
+                "experiment_mode": "onn_feedback",
+                "checkpoint_selection": "last_epoch",
+            },
+        }
+        checkpoint = _end_to_end_checkpoint(
+            predictor,
+            optimizer,
+            None,
+            25,
+            2000,
+            None,
+            {"train_video_ids": ["a"], "val_video_ids": ["b"]},
+            "/tmp/split.json",
+            config,
+            "best",
+            best_epoch=25,
+            experiment_mode="onn_feedback",
+        )
+        self.assertEqual(checkpoint["checkpoint_selection"], "last_epoch")
+        self.assertEqual(checkpoint["selected_epoch"], 25)
+        self.assertIsNone(checkpoint["best_val_jepa_loss"])
+
+
+class LastEpochTrainingFlowTests(unittest.TestCase):
+    def test_last_epoch_mode_skips_validation_and_selects_final_state(self):
+        from evals.intuitive_physics import train_optical
+
+        config = {
+            "predictor_type": "onn_feedback",
+            "mask_mode": "causal_prefix",
+            "pretrain": {
+                "folder": "/checkpoint",
+                "checkpoint": "official.pt",
+            },
+            "data": {"batch_size": 1},
+            "data_split": {
+                "num_train_videos": 1,
+                "num_val_videos": 1,
+                "split_seed": 42,
+            },
+            "training": {
+                "experiment_mode": "onn_feedback",
+                "epochs": 2,
+                "checkpoint_selection": "last_epoch",
+                "causal_context_lengths": [4, 6, 8, 10, 12],
+            },
+        }
+        split = {
+            "train_video_ids": ["train"],
+            "val_video_ids": ["val"],
+        }
+        predictor = torch.nn.Linear(2, 2)
+        metrics = {"jepa_loss": 0.5, "batches": 1, "elapsed_s": 0.1}
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "model.pt"
+            last = Path(directory) / "model.last.pt"
+            with patch.object(
+                train_optical, "_configure_logging", return_value=unittest.mock.Mock()
+            ), patch.object(
+                train_optical, "get_dataset_paths", return_value=[directory]
+            ), patch.object(
+                train_optical, "require_existing_video_split", return_value=split
+            ), patch.object(
+                train_optical,
+                "_prepare_end_to_end_models",
+                return_value=(
+                    torch.nn.Identity(),
+                    torch.nn.Identity(),
+                    predictor,
+                    {},
+                    [],
+                ),
+            ), patch.object(
+                train_optical, "_make_jepa_loaders", return_value=([object()], None)
+            ), patch.object(
+                train_optical, "_run_jepa_epoch", return_value=metrics
+            ) as run_epoch, patch.object(
+                train_optical, "_save_checkpoint"
+            ) as save_checkpoint, patch.object(
+                train_optical, "_write_training_summary"
+            ):
+                selected = train_optical.run_end_to_end_jepa(
+                    config,
+                    output_path=output,
+                    last_output=last,
+                    split_manifest=Path(directory) / "split.json",
+                    skip_final_eval=True,
+                    experiment_mode="onn_feedback",
+                    device=torch.device("cpu"),
+                )
+
+        self.assertEqual(run_epoch.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["training"] for call in run_epoch.call_args_list)
+        )
+        self.assertEqual(
+            [
+                call.kwargs["global_step_start"]
+                for call in run_epoch.call_args_list
+            ],
+            [0, 1],
+        )
+        self.assertEqual(selected["epoch"], 2)
+        self.assertEqual(selected["checkpoint_kind"], "best")
+        self.assertEqual(selected["checkpoint_selection"], "last_epoch")
+        self.assertIsNone(selected["best_val_jepa_loss"])
+        self.assertEqual(
+            [Path(call.args[1]).name for call in save_checkpoint.call_args_list],
+            ["model.last.pt", "model.last.pt", "model.pt"],
+        )
 
 
 class EndToEndJepaTests(unittest.TestCase):
