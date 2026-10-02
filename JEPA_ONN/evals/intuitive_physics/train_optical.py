@@ -37,12 +37,17 @@ from src.models.optical_distillation import (
 )
 from evals.intuitive_physics.data_manager import init_data
 from evals.intuitive_physics.eval import init_model
+from evals.causal_recurrent import (
+    compute_causal_recurrent_loss,
+    encode_independent_chunks,
+)
 from evals.intuitive_physics.optical_split import (
     load_or_create_video_split,
     require_existing_video_split,
 )
 from evals.intuitive_physics.utils import get_dataset_paths, get_time_masks
 from src.utils.transforms import make_transforms
+from src.utils.amp import autocast_context
 
 
 _require_existing_video_split = require_existing_video_split
@@ -86,9 +91,27 @@ def _set_predictor_trainability(predictor):
     model = _unwrap_module(predictor)
     if hasattr(model, "backbone"):
         model = model.backbone
-    if getattr(model, "direct_384_loss", False):
+    is_causal_recurrent = all(
+        hasattr(model, name)
+        for name in ("input_onn", "memory_onn", "prediction_onn")
+    )
+    if getattr(model, "direct_384_loss", False) or is_causal_recurrent:
         for parameter in model.predictor_embed.parameters():
             parameter.requires_grad_(False)
+    if is_causal_recurrent:
+        for onn in (
+            model.input_onn,
+            model.memory_onn,
+            model.prediction_onn,
+        ):
+            config = getattr(onn, "config", None)
+            feedback_gain = getattr(onn, "feedback_gain_raw", None)
+            if (
+                config is not None
+                and not config.feedback_enabled
+                and feedback_gain is not None
+            ):
+                feedback_gain.requires_grad_(False)
 
 
 def _feedback_runtime_metadata(predictor):
@@ -668,6 +691,7 @@ def _resolve_experiment_mode(args_eval):
         "optical_qkv",
         "realtime_last_node_distillation",
         "onn_feedback",
+        "onn_causal_recurrent",
     }:
         raise ValueError(f"unsupported experiment mode: {mode}")
     if (
@@ -1246,6 +1270,8 @@ def _make_causal_prefix_masks(
 
 
 def _make_jepa_mask_collator(args_eval):
+    if _resolve_experiment_mode(args_eval) == "onn_causal_recurrent":
+        return None
     mask_mode = _resolve_mask_mode(args_eval)
     if mask_mode == "causal_prefix":
         return None
@@ -1415,6 +1441,14 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
     if predictor_type == "onn_feedback":
         optical_config = copy.deepcopy(onn_cfg)
         replace_layers = []
+    elif predictor_type == "onn_causal_recurrent":
+        if experiment_mode != "onn_causal_recurrent":
+            raise ValueError(
+                "predictor_type=onn_causal_recurrent requires matching "
+                "training.experiment_mode"
+            )
+        optical_config = copy.deepcopy(onn_cfg)
+        replace_layers = []
     elif experiment_mode == "optical_qkv":
         if optical_cfg.get("qkv_backend") != "fsonn_tdm":
             raise ValueError(
@@ -1453,7 +1487,11 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
         wide_SiLU=args_eval["pretrain"].get("wide_silu", True),
         use_sdpa=args_eval["pretrain"].get("use_sdpa", True),
         is_mae=False,
-        optical_qkv={} if predictor_type == "onn_feedback" else optical_cfg,
+        optical_qkv=(
+            {}
+            if predictor_type in {"onn_feedback", "onn_causal_recurrent"}
+            else optical_cfg
+        ),
         predictor_type=predictor_type,
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
         temporal_difference_enabled=args_eval.get("predictor", {}).get(
@@ -1469,8 +1507,12 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
             "direct_384_loss", False
         ),
         onn_feedback_config=onn_cfg,
+        causal_recurrent_config=args_eval.get("predictor", {}),
     )
-    if predictor_type != "onn_feedback" and experiment_mode == "optical_qkv":
+    if (
+        predictor_type not in {"onn_feedback", "onn_causal_recurrent"}
+        and experiment_mode == "optical_qkv"
+    ):
         vit_pred.install_optical_qkv(
             predictor,
             optical_config=optical_config,
@@ -1483,23 +1525,29 @@ def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv")
             parameter.requires_grad_(False)
     predictor.train()
     _set_predictor_trainability(predictor)
-    if predictor_type == "onn_feedback":
+    if predictor_type in {"onn_feedback", "onn_causal_recurrent"}:
         assert all(not p.requires_grad for p in encoder.parameters())
         assert all(not p.requires_grad for p in target_encoder.parameters())
         predictor_parameters = dict(predictor.named_parameters())
         predictor_buffers = dict(predictor.named_buffers())
-        pos_names = [
-            name for name in predictor_buffers
-            if name.endswith("predictor_pos_embed")
-        ]
-        assert pos_names
-        assert all(
-            "predictor_pos_embed" not in name
-            for name in predictor_parameters
-        )
-        assert all(
-            not predictor_buffers[name].requires_grad for name in pos_names
-        )
+        if predictor_type == "onn_feedback":
+            pos_names = [
+                name for name in predictor_buffers
+                if name.endswith("predictor_pos_embed")
+            ]
+            assert pos_names
+            assert all(
+                "predictor_pos_embed" not in name
+                for name in predictor_parameters
+            )
+            assert all(
+                not predictor_buffers[name].requires_grad for name in pos_names
+            )
+        else:
+            assert all(
+                not parameter.requires_grad
+                for parameter in predictor.predictor_embed.parameters()
+            )
     return encoder, target_encoder, predictor, optical_config, replace_layers
 
 
@@ -1640,6 +1688,166 @@ def _run_jepa_epoch(
     return metrics
 
 
+def _run_causal_recurrent_epoch(
+    loader,
+    args_eval,
+    encoder,
+    target_encoder,
+    predictor,
+    optimizer,
+    device,
+    logger,
+    epoch,
+    training,
+    max_steps=None,
+    clip_grad=10.0,
+    rank=0,
+    world_size=1,
+    global_step_start=0,
+):
+    stage = "train" if training else "val"
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(int(epoch))
+    predictor.train(training)
+    encoder.eval()
+    target_encoder.eval()
+
+    totals = {
+        "loss": 0.0,
+        "global_loss": 0.0,
+        "motion_loss": 0.0,
+    }
+    batches = 0
+    started = time.perf_counter()
+    stage_total = len(loader)
+    if max_steps is not None:
+        stage_total = min(stage_total, int(max_steps))
+
+    predictor_model = _unwrap_module(predictor)
+    predictor_cfg = args_eval.get("predictor", {})
+    loss_cfg = args_eval.get("loss", {})
+    chunk_frames = int(predictor_cfg.get("chunk_frames", 2))
+    chunk_tokens = int(predictor_cfg.get("chunk_tokens", 196))
+    use_bfloat16 = bool(args_eval.get("data", {}).get("use_bfloat16", False))
+
+    for batch_index, batch in enumerate(loader):
+        if max_steps is not None and batch_index >= int(max_steps):
+            break
+        step_started = time.perf_counter()
+        clips = _extract_jepa_clips(batch, device)
+        with autocast_context(device, use_bfloat16):
+            context_features, target_features = encode_independent_chunks(
+                clips,
+                encoder,
+                target_encoder,
+                chunk_frames=chunk_frames,
+                chunk_tokens=chunk_tokens,
+            )
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, use_bfloat16):
+                predictions = predictor(context_features)
+                prepared_targets = predictor_model.prepare_target_features(
+                    target_features
+                )
+                losses = compute_causal_recurrent_loss(
+                    predictions,
+                    prepared_targets,
+                    loss_exp=loss_cfg.get("loss_exp", 1.0),
+                    motion_beta=loss_cfg.get("motion_beta", 1.0),
+                    motion_epsilon=loss_cfg.get("motion_epsilon", 1.0e-6),
+                )
+            losses["loss"].backward()
+            trainable = [
+                parameter
+                for parameter in predictor.parameters()
+                if parameter.requires_grad
+            ]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable, float(clip_grad)
+            )
+            optimizer.step()
+        else:
+            with torch.no_grad(), autocast_context(device, use_bfloat16):
+                predictions = predictor(context_features)
+                prepared_targets = predictor_model.prepare_target_features(
+                    target_features
+                )
+                losses = compute_causal_recurrent_loss(
+                    predictions,
+                    prepared_targets,
+                    loss_exp=loss_cfg.get("loss_exp", 1.0),
+                    motion_beta=loss_cfg.get("motion_beta", 1.0),
+                    motion_epsilon=loss_cfg.get(
+                        "motion_epsilon", 1.0e-6
+                    ),
+                )
+            grad_norm = torch.tensor(0.0, device=device)
+
+        _sync_for_timing(device)
+        batches += 1
+        for name in totals:
+            totals[name] += float(losses[name].detach())
+        if int(rank) == 0:
+            logger.info(
+                "epoch=%d stage=%s step=%d/%d batch_size=%d "
+                "loss=%.6f global_loss=%.6f motion_loss=%.6f "
+                "grad_norm=%.6f time=%.3fs",
+                epoch,
+                stage,
+                batches,
+                stage_total,
+                clips.shape[0],
+                float(losses["loss"].detach()),
+                float(losses["global_loss"].detach()),
+                float(losses["motion_loss"].detach()),
+                float(grad_norm),
+                time.perf_counter() - step_started,
+            )
+
+    if world_size > 1:
+        stats = torch.tensor(
+            [
+                totals["loss"],
+                totals["global_loss"],
+                totals["motion_loss"],
+                float(batches),
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        totals["loss"] = float(stats[0].item())
+        totals["global_loss"] = float(stats[1].item())
+        totals["motion_loss"] = float(stats[2].item())
+        batches = int(round(float(stats[3].item())))
+    if batches == 0:
+        raise RuntimeError(f"{stage} loader produced no batches")
+
+    metrics = {
+        "jepa_loss": totals["loss"] / batches,
+        "global_loss": totals["global_loss"] / batches,
+        "motion_loss": totals["motion_loss"] / batches,
+        "batches": batches,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    if int(rank) == 0:
+        logger.info(
+            "epoch=%d stage=%s_done batches=%d loss=%.6f "
+            "global_loss=%.6f motion_loss=%.6f time=%.3fs",
+            epoch,
+            stage,
+            batches,
+            metrics["jepa_loss"],
+            metrics["global_loss"],
+            metrics["motion_loss"],
+            metrics["elapsed_s"],
+        )
+    return metrics
+
+
 def _end_to_end_checkpoint(
     predictor,
     optimizer,
@@ -1665,6 +1873,7 @@ def _end_to_end_checkpoint(
         "optical_qkv": "end_to_end_jepa",
         "electronic_control": "electronic_control",
         "onn_feedback": "onn_feedback",
+        "onn_causal_recurrent": "onn_causal_recurrent",
     }.get(experiment_mode)
     if checkpoint_mode is None:
         raise ValueError(f"unsupported checkpoint experiment mode: {experiment_mode}")
@@ -1695,7 +1904,10 @@ def _end_to_end_checkpoint(
         "num_chunks": 8,
         "chunk_tokens": 196,
         "predictor_dim": 384,
-        "output_dim": 1024,
+        "output_dim": (
+            predictor_model.embed_dim
+            if experiment_mode == "onn_causal_recurrent" else 1024
+        ),
         "readout_mode": "learnable_offset",
         "differential_detector": False,
         "world_size": int(world_size),
@@ -1724,6 +1936,30 @@ def _end_to_end_checkpoint(
         "split_manifest": os.path.abspath(split_manifest),
     }
     checkpoint.update(_feedback_runtime_metadata(predictor))
+    if experiment_mode == "onn_causal_recurrent":
+        predictor_cfg = args_eval.get("predictor", {})
+        loss_cfg = args_eval.get("loss", {})
+        checkpoint.update(
+            {
+                "architecture_version": 2,
+                "output_mode": "linear",
+                "loss_feature_dim": predictor_model.embed_dim,
+                "output_layer_norm": False,
+                "test_score_mapping": "reciprocal",
+                "num_context_chunks": int(
+                    predictor_cfg.get("num_context_chunks", 7)
+                ),
+                "chunk_frames": int(predictor_cfg.get("chunk_frames", 2)),
+                "memory_lambda": float(
+                    predictor_cfg.get("memory_lambda", 0.5)
+                ),
+                "motion_beta": float(loss_cfg.get("motion_beta", 1.0)),
+                "motion_epsilon": float(
+                    loss_cfg.get("motion_epsilon", 1.0e-6)
+                ),
+                "primary_test_score": "unweighted_prediction_error",
+            }
+        )
     return checkpoint
 
 
@@ -2076,7 +2312,12 @@ def run_end_to_end_jepa(
     world_size=1,
     gpu_ids=None,
 ):
-    if experiment_mode not in {"optical_qkv", "electronic_control", "onn_feedback"}:
+    if experiment_mode not in {
+        "optical_qkv",
+        "electronic_control",
+        "onn_feedback",
+        "onn_causal_recurrent",
+    }:
         raise ValueError(
             f"run_end_to_end_jepa does not support {experiment_mode}"
         )
@@ -2236,6 +2477,11 @@ def run_end_to_end_jepa(
     best_epoch = 0
     global_step = 0
     start_epoch = 1
+    epoch_runner = (
+        _run_causal_recurrent_epoch
+        if experiment_mode == "onn_causal_recurrent"
+        else _run_jepa_epoch
+    )
     if resume_checkpoint is not None:
         logger.info("resume_start checkpoint=%s", os.path.abspath(resume_checkpoint))
         resumed = _load_end_to_end_checkpoint(
@@ -2259,7 +2505,7 @@ def run_end_to_end_jepa(
     best_checkpoint = None
     clip_grad = float(training_cfg.get("clip_grad", 10.0))
     if resume_checkpoint is None and validation_enabled:
-        initial_val_metrics = _run_jepa_epoch(
+        initial_val_metrics = epoch_runner(
             val_loader,
             args_eval,
             encoder,
@@ -2306,7 +2552,7 @@ def run_end_to_end_jepa(
         )
     last_completed_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs + 1):
-        train_metrics = _run_jepa_epoch(
+        train_metrics = epoch_runner(
             train_loader,
             args_eval,
             encoder,
@@ -2328,7 +2574,7 @@ def run_end_to_end_jepa(
         val_metrics = None
         improved = False
         if validation_enabled:
-            val_metrics = _run_jepa_epoch(
+            val_metrics = epoch_runner(
                 val_loader,
                 args_eval,
                 encoder,
@@ -2580,7 +2826,12 @@ def _run_selected_mode(
             device=device,
             gpu_id=gpu_ids[rank],
         )
-    if mode in {"onn_feedback", "optical_qkv", "electronic_control"}:
+    if mode in {
+        "onn_feedback",
+        "onn_causal_recurrent",
+        "optical_qkv",
+        "electronic_control",
+    }:
         return run_end_to_end_jepa(
             config,
             output_path=outputs["output"],
@@ -2625,6 +2876,7 @@ def main():
         "--experiment-mode",
         choices=(
             "onn_feedback",
+            "onn_causal_recurrent",
             "electronic_control",
             "optical_qkv",
             "realtime_last_node_distillation",

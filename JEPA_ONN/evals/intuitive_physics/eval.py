@@ -40,7 +40,9 @@ from src.masks.utils import apply_masks
 import src.models.vision_transformer as vit
 import src.models.predictor as vit_pred
 from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
-from src.models.fsonn import OpticalQKVConfig
+from src.models.fsonn import ONNConfig, OpticalQKVConfig
+from src.models.causal_recurrent_onn import CausalRecurrentONNPredictor
+from evals.causal_recurrent import evaluate_causal_recurrent_windows, reduce_scores
 from src.models.optical_distillation import load_optical_checkpoint
 from evals.intuitive_physics.data_manager import init_data
 from src.masks.random_tube import MaskCollator as TubeMaskCollator
@@ -289,6 +291,10 @@ def main(args_eval, resume_preempt=False):
     mae_decoder_blocks = args_eval.get('mae_decoder_blocks', -1)
     normalize_targets =args_eval.get('normalize_targets',True)
     last_context_copy_baseline = _last_context_copy_enabled(args_eval)
+    predictor_type = args_eval.get("predictor_type", "onn_feedback")
+    evaluation_config = args_eval.get("evaluation") or {}
+    if predictor_type == "onn_causal_recurrent":
+        all_context_lengths = ["causal_recurrent"]
     # ----------------------------------------------------------------------- #
 
     try:
@@ -344,7 +350,7 @@ def main(args_eval, resume_preempt=False):
         is_mae=is_mae,
         optical_qkv=optical_qkv,
         predictor_checkpoint=predictor_checkpoint,
-        predictor_type=args_eval.get("predictor_type", "onn_feedback"),
+        predictor_type=predictor_type,
         output_mode=args_eval.get("predictor", {}).get("output_mode", "mlp"),
         temporal_difference_enabled=args_eval.get("predictor", {}).get(
             "temporal_difference_enabled", False
@@ -361,6 +367,7 @@ def main(args_eval, resume_preempt=False):
         onn_feedback_config=args_eval.get(
             "onn", args_eval.get("onn_feedback", optical_qkv)
         ),
+        causal_recurrent_config=args_eval.get("predictor", {}),
     )
 
     if not is_mae:
@@ -397,7 +404,7 @@ def main(args_eval, resume_preempt=False):
             logger.info(f"Doing property {block} ...")
             if mode in ['losses','all']:
                 logger.info(f"Extracting loss ...")
-                all_losses,all_labels,official_group_losses,official_group_labels  = extract_losses(
+                extracted = extract_losses(
                     device=device,
                     encoder=encoder,
                     target_encoder=target_encoder,
@@ -420,10 +427,43 @@ def main(args_eval, resume_preempt=False):
                     resolution=resolution,
                     normalize_targets=normalize_targets,
                     last_context_copy_baseline=last_context_copy_baseline,
+                    predictor_type=predictor_type,
+                    motion_epsilon=args_eval.get("loss", {}).get(
+                        "motion_epsilon", 1.0e-6
+                    ),
+                    spatial_reduction=evaluation_config.get(
+                        "spatial_reduction", "mean"
+                    ),
+                    spatial_top_n=evaluation_config.get(
+                        "spatial_top_n", 20
+                    ),
+                    return_causal_diagnostics=(
+                        predictor_type == "onn_causal_recurrent"
+                    ),
                     progress_log=progress_log)
+                if predictor_type == "onn_causal_recurrent":
+                    (
+                        all_losses,
+                        all_labels,
+                        official_group_losses,
+                        official_group_labels,
+                        causal_diagnostics,
+                    ) = extracted
+                else:
+                    (
+                        all_losses,
+                        all_labels,
+                        official_group_losses,
+                        official_group_labels,
+                    ) = extracted
+                    causal_diagnostics = {}
 
                 all_losses = batch_all_gather(all_losses).cpu()
                 all_labels = batch_all_gather(all_labels).cpu()
+                causal_diagnostics = {
+                    name: batch_all_gather(values).cpu()
+                    for name, values in causal_diagnostics.items()
+                }
                 if dataset == "intphys":
                     official_group_losses = batch_all_gather(
                         official_group_losses
@@ -445,6 +485,7 @@ def main(args_eval, resume_preempt=False):
                                 "labels":all_labels,
                                 "official_group_losses":official_group_losses,
                                 "official_group_labels":official_group_labels,
+                                "causal_diagnostics":causal_diagnostics,
                                 },
                                 os.path.join(folder, f'losses_{block}_{frame_step}fs_{"_".join([str(ctxt) for ctxt in all_context_lengths])}ctxt.pth'))
 
@@ -456,6 +497,9 @@ def main(args_eval, resume_preempt=False):
                     all_labels = data["labels"]
                     official_group_losses = data.get("official_group_losses")
                     official_group_labels = data.get("official_group_labels")
+                    causal_diagnostics = data.get(
+                        "causal_diagnostics", {}
+                    )
 
                 if dataset == "intphys":
                     if official_group_losses is None or official_group_labels is None:
@@ -469,14 +513,24 @@ def main(args_eval, resume_preempt=False):
                         )
                     )
 
+                temporal_kwargs = (
+                    {
+                        "temporal_reduction": evaluation_config.get(
+                            "temporal_reduction", "mean"
+                        ),
+                        "temporal_top_n": evaluation_config.get("temporal_top_n", 2),
+                    }
+                    if predictor_type == "onn_causal_recurrent" else {}
+                )
                 for i,context in enumerate(all_context_lengths):
                     losses = all_losses[:,i]
-                    metrics = compute_metrics(losses,all_labels)
+                    metrics = compute_metrics(losses,all_labels, **temporal_kwargs)
                     if dataset == "intphys":
                         metrics.update(
                             compute_official_metrics(
                                 official_group_losses[:, :, i, :],
                                 official_group_labels,
+                                **temporal_kwargs,
                             )
                         )
 
@@ -509,13 +563,14 @@ def main(args_eval, resume_preempt=False):
 
 
                 filtered = all_losses.min(1)[0]
-                metrics = compute_metrics(filtered,all_labels)
+                metrics = compute_metrics(filtered,all_labels, **temporal_kwargs)
                 if dataset == "intphys":
                     filtered_group_losses = official_group_losses.min(2)[0]
                     metrics.update(
                         compute_official_metrics(
                             filtered_group_losses,
                             official_group_labels,
+                            **temporal_kwargs,
                         )
                     )
                 if rank == 0:
@@ -570,7 +625,9 @@ def normalize_official_group_tensors(group_losses, group_labels):
         )
     return group_losses, group_labels
 
-def compute_official_metrics(group_losses, group_labels):
+def compute_official_metrics(
+    group_losses, group_labels, temporal_reduction=None, temporal_top_n=2
+):
     """Compute official IntPhys metrics from complete 4-video groups.
 
     group_losses has shape [num_groups, 4, num_windows] and group_labels
@@ -611,11 +668,16 @@ def compute_official_metrics(group_losses, group_labels):
         "official_num_impossible": int((~group_labels).sum().item()),
     }
 
-    for aggregation in ("mean", "max"):
-        if aggregation == "mean":
-            video_plausibility = (-group_losses.mean(dim=-1)).numpy()
-        else:
-            video_plausibility = (-group_losses.max(dim=-1).values).numpy()
+    aggregations = [("mean", "mean"), ("max", "max")]
+    if temporal_reduction is not None:
+        aggregations.append(("selected", temporal_reduction))
+        results["official_selected_aggregation"] = str(temporal_reduction)
+        results["official_selected_top_k"] = min(int(temporal_top_n), group_losses.shape[-1])
+
+    for aggregation, mode in aggregations:
+        video_plausibility = (-reduce_scores(
+            group_losses, mode, dim=-1, top_n=temporal_top_n
+        )).numpy()
 
         possible_sum = np.where(
             labels_np, video_plausibility, 0.0
@@ -635,7 +697,7 @@ def compute_official_metrics(group_losses, group_labels):
 
     return results
 
-def compute_metrics(losses,labels):
+def compute_metrics(losses, labels, temporal_reduction=None, temporal_top_n=2):
     metrics = {}
     loss_real = losses[torch.where(labels == 1)]
     loss_fake = losses[torch.where(labels == 0)]
@@ -692,6 +754,20 @@ def compute_metrics(losses,labels):
 
     metrics["AUROC (avg)"] = auroc_mean
     metrics["AUROC (max)"] = auroc_max
+    if temporal_reduction is not None:
+        selected = reduce_scores(
+            losses, temporal_reduction, dim=-1, top_n=temporal_top_n
+        )
+        selected_real = selected[labels == 1]
+        selected_fake = selected[labels == 0]
+        metrics["Relative Accuracy (selected)"] = (
+            (selected_real < selected_fake).float().mean().item() * 100.0
+        )
+        metrics["AUROC (selected)"] = float(roc_auc_score(labels, -selected))
+        precision, recall, _ = precision_recall_curve(labels, -selected)
+        metrics["AUPRC (selected)"] = float(auc(recall, precision))
+        metrics["Temporal aggregation"] = str(temporal_reduction)
+        metrics["Temporal top k"] = min(int(temporal_top_n), losses.shape[-1])
     return metrics
 
 
@@ -720,6 +796,11 @@ def extract_losses(
     resolution=224,
     normalize_targets=True,
     last_context_copy_baseline=False,
+    predictor_type="vit_transformer",
+    motion_epsilon=1.0e-6,
+    spatial_reduction="mean",
+    spatial_top_n=20,
+    return_causal_diagnostics=False,
     progress_log=None
 ):
     if progress_log is None:
@@ -777,6 +858,11 @@ def extract_losses(
     all_losses = []
     official_group_losses = []
     official_group_labels = []
+    causal_diagnostics = {
+        "motion_weighted_score": [],
+        "motion_only_score": [],
+        "copy_baseline_score": [],
+    }
 
     for i in range(total_batches):
         udata_labels = next(loader)
@@ -814,7 +900,46 @@ def extract_losses(
 
 
         all_losses_ctxt = []
-        for CTXT_LEN in context_lengths:
+        current_causal_diagnostics = None
+        if predictor_type == "onn_causal_recurrent":
+            if is_mae or last_context_copy_baseline:
+                raise ValueError(
+                    "causal recurrent evaluation is incompatible with "
+                    "MAE and last-context-copy modes"
+                )
+            with autocast_context(device, use_bfloat16):
+                recurrent_scores = evaluate_causal_recurrent_windows(
+                    pieces,
+                    encoder,
+                    target_encoder,
+                    predictor,
+                    chunk_frames=2,
+                    chunk_tokens=(resolution // patch_size) ** 2,
+                    motion_epsilon=motion_epsilon,
+                    spatial_reduction=spatial_reduction,
+                    spatial_top_n=spatial_top_n,
+                )
+            all_losses_ctxt.append(
+                recurrent_scores["primary_step_scores"].reshape(
+                    num_videos, -1
+                )
+            )
+            current_causal_diagnostics = {
+                "motion_weighted_score": recurrent_scores[
+                    "motion_weighted_step_scores"
+                ].reshape(num_videos, -1),
+                "motion_only_score": recurrent_scores[
+                    "motion_only_step_scores"
+                ].reshape(num_videos, -1),
+                "copy_baseline_score": recurrent_scores[
+                    "copy_step_scores"
+                ].reshape(num_videos, -1),
+            }
+        loop_context_lengths = (
+            [] if predictor_type == "onn_causal_recurrent"
+            else context_lengths
+        )
+        for CTXT_LEN in loop_context_lengths:
 
             m,m_,full_m = get_time_masks(CTXT_LEN,spatial_size=(patch_size,patch_size),temporal_dim=frames_per_clip,as_bool=is_mae)
             full_m = full_m.unsqueeze(0).to(device)
@@ -908,6 +1033,9 @@ def extract_losses(
         for match in matches:
             all_losses.append(losses[match])
             all_labels.append(labels[match])
+            if current_causal_diagnostics is not None:
+                for name, values in current_causal_diagnostics.items():
+                    causal_diagnostics[name].append(values[match])
 
         current_batch = i + 1
         if current_batch % 10 == 0 or current_batch == total_batches:
@@ -960,7 +1088,21 @@ def extract_losses(
     if close_progress_log:
         progress_log.close()
 
-    return all_losses,all_labels.to(device),official_group_losses,official_group_labels.to(device) if official_group_labels is not None else None
+    result = (
+        all_losses,
+        all_labels.to(device),
+        official_group_losses,
+        official_group_labels.to(device)
+        if official_group_labels is not None
+        else None,
+    )
+    if return_causal_diagnostics:
+        finalized_diagnostics = {
+            name: torch.concat(pad_tensors(values, max_length.item()))
+            for name, values in causal_diagnostics.items()
+        }
+        return (*result, finalized_diagnostics)
+    return result
 
 
 
@@ -991,6 +1133,7 @@ def load_pretrained(
     pred_checkpoint_key='predictor',
     is_mae=False,
     load_predictor=True,
+    load_predictor_embed=False,
 ):
     logger.info(f'Loading pretrained model from {pretrained}')
     checkpoint = torch.load(pretrained, map_location='cpu')
@@ -1028,6 +1171,22 @@ def load_pretrained(
                 f' path: {pretrained}'
             )
             print(predictor)
+        elif load_predictor_embed:
+            try:
+                pred_pretrained_dict = checkpoint[pred_checkpoint_key]
+            except Exception:
+                pred_pretrained_dict = checkpoint["predictor"]
+            predictor_model = (
+                predictor.backbone
+                if hasattr(predictor, "backbone")
+                else predictor
+            )
+            predictor_model.load_predictor_embed_state_dict(
+                pred_pretrained_dict
+            )
+            logger.info(
+                "loaded frozen predictor_embed from pretrained Predictor"
+            )
         else:
             logger.info("skipping legacy Predictor checkpoint for ONN feedback mode")
 
@@ -1036,7 +1195,12 @@ def load_pretrained(
 
 
 def _is_full_predictor_checkpoint_mode(checkpoint_mode):
-    return checkpoint_mode in {"end_to_end_jepa", "electronic_control", "onn_feedback"}
+    return checkpoint_mode in {
+        "end_to_end_jepa",
+        "electronic_control",
+        "onn_feedback",
+        "onn_causal_recurrent",
+    }
 
 
 def init_model(
@@ -1069,6 +1233,7 @@ def init_model(
     predictor_checkpoint=None,
     predictor_type="vit_transformer",
     onn_feedback_config=None,
+    causal_recurrent_config=None,
 ):
     optical_qkv = optical_qkv or {}
     if is_mae:
@@ -1126,6 +1291,25 @@ def init_model(
                 uniform_power=uniform_power,
                 optical_config=onn_config,
             )
+        elif predictor_type == "onn_causal_recurrent":
+            predictor_cfg = dict(causal_recurrent_config or {})
+            onn_config = ONNConfig.from_mapping(
+                dict(onn_feedback_config or optical_qkv)
+            )
+            predictor = CausalRecurrentONNPredictor(
+                embed_dim=encoder.backbone.embed_dim,
+                predictor_embed_dim=pred_embed_dim,
+                num_context_chunks=int(
+                    predictor_cfg.get("num_context_chunks", 7)
+                ),
+                chunk_tokens=int(
+                    predictor_cfg.get("chunk_tokens", 196)
+                ),
+                memory_lambda=float(
+                    predictor_cfg.get("memory_lambda", 0.5)
+                ),
+                onn_config=onn_config,
+            )
         elif predictor_type == "vit_transformer":
             use_rope = 'rope' in model_name
             rope_is_1D = 'rope1D' in model_name
@@ -1154,7 +1338,8 @@ def init_model(
             )
         else:
             raise ValueError(f"unsupported predictor_type: {predictor_type}")
-        predictor = PredictorMultiMaskWrapper(predictor)
+        if predictor_type != "onn_causal_recurrent":
+            predictor = PredictorMultiMaskWrapper(predictor)
         predictor.to(device)
         target_encoder.to(device)
 
@@ -1167,10 +1352,18 @@ def init_model(
         enc_checkpoint_key=enc_checkpoint_key,
         pred_checkpoint_key=pred_checkpoint_key,
         is_mae=is_mae,
-        load_predictor=(predictor_type != "onn_feedback"),
+        load_predictor=(
+            predictor_type not in {"onn_feedback", "onn_causal_recurrent"}
+        ),
+        load_predictor_embed=(
+            predictor_type == "onn_causal_recurrent"
+        ),
     )
 
-    if predictor_type != "onn_feedback" and qkv_backend == "fsonn_tdm":
+    if (
+        predictor_type not in {"onn_feedback", "onn_causal_recurrent"}
+        and qkv_backend == "fsonn_tdm"
+    ):
         vit_pred.install_optical_qkv(
             predictor,
             optical_config=optical_config,
