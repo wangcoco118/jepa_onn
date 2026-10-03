@@ -42,7 +42,7 @@ watch -n 5 nvidia-smi
 
 nvidia-smi
 
-tmux new -s d2nn
+
 
 tmux attach -t d2nn
 

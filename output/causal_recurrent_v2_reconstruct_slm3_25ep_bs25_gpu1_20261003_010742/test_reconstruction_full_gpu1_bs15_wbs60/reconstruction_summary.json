@@ -1,0 +1,28 @@
+{
+  "evaluation_kind": "reconstruction_test",
+  "objective": "reconstruct_current",
+  "checkpoint_epoch": 25,
+  "complete": true,
+  "processed_videos": 12960,
+  "total_videos": 12960,
+  "batches": 648,
+  "windows_per_video": 17,
+  "scored_chunks_per_window": 7,
+  "reconstruction_l1": 0.5385714173316956,
+  "per_step_l1": [
+    0.5379422903060913,
+    0.5373589992523193,
+    0.5380883812904358,
+    0.5390039682388306,
+    0.5391679406166077,
+    0.5391969680786133,
+    0.539241373538971
+  ],
+  "elapsed_s": 4705.055167334154,
+  "output_dir": "/data/linux/wkx/IntPhys/references_code/jepa_onn/output/causal_recurrent_v2_reconstruct_slm3_25ep_bs25_gpu1_20261003_010742/test_reconstruction_full_gpu1_bs15_wbs60",
+  "score_mapping": "reciprocal",
+  "spatial_reduction": "mean",
+  "temporal_reduction": "mean",
+  "official_metrics_available": false,
+  "answer_dir": "/data/linux/wkx/IntPhys/references_code/jepa_onn/output/causal_recurrent_v2_reconstruct_slm3_25ep_bs25_gpu1_20261003_010742/test_reconstruction_full_gpu1_bs15_wbs60/intphys-test-reconstruction"
+}

@@ -42,7 +42,8 @@ import src.models.predictor as vit_pred
 from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
 from src.models.fsonn import ONNConfig, OpticalQKVConfig
 from src.models.causal_recurrent_onn import CausalRecurrentONNPredictor
-from evals.causal_recurrent import evaluate_causal_recurrent_windows, reduce_scores
+from evals.causal_recurrent import (evaluate_causal_recurrent_windows, reduce_scores,
+    validate_causal_config, validate_causal_checkpoint, causal_runtime_metadata)
 from src.models.optical_distillation import load_optical_checkpoint
 from evals.intuitive_physics.data_manager import init_data
 from src.masks.random_tube import MaskCollator as TubeMaskCollator
@@ -237,6 +238,12 @@ def _prepare_intphys_batch(clips, labels):
 
 
 def main(args_eval, resume_preempt=False):
+    if args_eval.get("predictor_type") == "onn_causal_recurrent":
+        validate_causal_config(args_eval, ordinary_test=True)
+        if args_eval.get("predictor_checkpoint"):
+            validate_causal_checkpoint(torch.load(args_eval["predictor_checkpoint"],
+                map_location="cpu", weights_only=False), args_eval)
+        logger.info("causal_mode %s", causal_runtime_metadata(args_eval))
 
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -486,6 +493,10 @@ def main(args_eval, resume_preempt=False):
                                 "official_group_losses":official_group_losses,
                                 "official_group_labels":official_group_labels,
                                 "causal_diagnostics":causal_diagnostics,
+                                "causal_mode": (
+                                    causal_runtime_metadata(args_eval)
+                                    if predictor_type == "onn_causal_recurrent" else None
+                                ),
                                 },
                                 os.path.join(folder, f'losses_{block}_{frame_step}fs_{"_".join([str(ctxt) for ctxt in all_context_lengths])}ctxt.pth'))
 
@@ -1309,6 +1320,8 @@ def init_model(
                     predictor_cfg.get("memory_lambda", 0.5)
                 ),
                 onn_config=onn_config,
+                feature_source=predictor_cfg.get("feature_source", "legacy_dual"),
+                objective=predictor_cfg.get("objective", "next_chunk"),
             )
         elif predictor_type == "vit_transformer":
             use_rope = 'rope' in model_name
@@ -1391,6 +1404,11 @@ def init_model(
                 raise ValueError(
                     "trained Predictor checkpoint has no full Predictor state"
                 )
+            if predictor_type == "onn_causal_recurrent":
+                cfg = copy.deepcopy(checkpoint.get("config") or {})
+                cfg.setdefault("predictor", {}).update(feature_source=predictor.feature_source,
+                                                       objective=predictor.objective)
+                validate_causal_checkpoint(checkpoint, cfg)
             _load_state_dict_checked(
                 predictor, checkpoint["predictor"], "trained predictor"
             )

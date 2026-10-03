@@ -25,8 +25,16 @@ class CausalRecurrentONNPredictor(nn.Module):
         input_onn: Optional[nn.Module] = None,
         memory_onn: Optional[nn.Module] = None,
         prediction_onn: Optional[nn.Module] = None,
+        feature_source: str = "legacy_dual",
+        objective: str = "next_chunk",
     ):
         super().__init__()
+        if feature_source not in {"legacy_dual", "shared_target"}:
+            raise ValueError("invalid feature_source")
+        if objective not in {"next_chunk", "reconstruct_current"}:
+            raise ValueError("invalid objective")
+        self.feature_source = feature_source
+        self.objective = objective
         self.embed_dim = int(embed_dim)
         self.predictor_embed_dim = int(predictor_embed_dim)
         self.num_context_chunks = int(num_context_chunks)

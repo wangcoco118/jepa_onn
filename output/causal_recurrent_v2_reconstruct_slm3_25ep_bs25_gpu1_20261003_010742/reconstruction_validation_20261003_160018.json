@@ -1,0 +1,41 @@
+{
+  "jepa_loss": 0.5558171570301056,
+  "global_loss": 0.5558171570301056,
+  "motion_loss": 0.0,
+  "batches": 14,
+  "elapsed_s": 62.254762237891555,
+  "reconstruction_l1": 0.5557718500494957,
+  "per_step_l1": [
+    0.5578373715281486,
+    0.5672040104866027,
+    0.5642039835453033,
+    0.5568070039153099,
+    0.5510971859097481,
+    0.5478575855493546,
+    0.5453956022858619
+  ],
+  "first_step_l1": 0.5578373715281486,
+  "prediction_std": 0.6522328242659569,
+  "target_std": 0.9999969616532326,
+  "prediction_variation_std": 0.3737559847533703,
+  "target_variation_std": 0.7902800679206848,
+  "feature_source": "shared_target",
+  "objective": "reconstruct_current",
+  "experiment_version": "V2",
+  "input_linear_frozen": true,
+  "encoder_weight_source": {
+    "context": "target_encoder",
+    "target": "target_encoder",
+    "pretrained": "/data/linux/wkx/IntPhys/references_code/references/checkpoints/vjepa/vitl16.pth.tar"
+  },
+  "normalization_rule": "shared_target_ln1024_then_projected_ln384",
+  "training_sampling_rate": 2,
+  "evaluation_frame_steps": 2,
+  "supervised_chunks": "1..7 (chunk 8 excluded)",
+  "std_aggregation": "sample-weighted batch standard deviations",
+  "checkpoint": "/data/linux/wkx/IntPhys/references_code/jepa_onn/output/causal_recurrent_v2_reconstruct_slm3_25ep_bs25_gpu1_20261003_010742/causal_recurrent_v2_reconstruct_slm3_25ep_bs25_gpu1.last.pt",
+  "evaluation_kind": "reconstruction_validation",
+  "checkpoint_epoch": 25,
+  "max_batches": null,
+  "evaluated_split": "val"
+}

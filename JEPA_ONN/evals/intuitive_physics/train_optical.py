@@ -40,6 +40,10 @@ from evals.intuitive_physics.eval import init_model
 from evals.causal_recurrent import (
     compute_causal_recurrent_loss,
     encode_independent_chunks,
+    validate_causal_config,
+    validate_causal_checkpoint,
+    causal_runtime_metadata,
+    compute_reconstruction_metrics,
 )
 from evals.intuitive_physics.optical_split import (
     load_or_create_video_split,
@@ -1433,6 +1437,8 @@ def _prepare_jepa_batch(
 
 def _prepare_end_to_end_models(args_eval, device, experiment_mode="optical_qkv"):
     predictor_type = args_eval.setdefault("predictor_type", "onn_feedback")
+    if predictor_type == "onn_causal_recurrent":
+        validate_causal_config(args_eval)
     optical_cfg = args_eval.get("optical_qkv", {})
     onn_cfg = args_eval.get(
         "onn", args_eval.get("onn_feedback", optical_cfg)
@@ -1727,6 +1733,14 @@ def _run_causal_recurrent_epoch(
     predictor_model = _unwrap_module(predictor)
     predictor_cfg = args_eval.get("predictor", {})
     loss_cfg = args_eval.get("loss", {})
+    feature_source, objective = validate_causal_config(args_eval)
+    if (getattr(predictor_model, "feature_source", "legacy_dual"),
+        getattr(predictor_model, "objective", "next_chunk")) != (feature_source, objective):
+        raise ValueError("Predictor mode does not match training config")
+    recon_totals = {}
+    recon_samples = 0
+    if int(rank) == 0:
+        logger.info("causal_mode %s", json.dumps(causal_runtime_metadata(args_eval)))
     chunk_frames = int(predictor_cfg.get("chunk_frames", 2))
     chunk_tokens = int(predictor_cfg.get("chunk_tokens", 196))
     use_bfloat16 = bool(args_eval.get("data", {}).get("use_bfloat16", False))
@@ -1743,6 +1757,7 @@ def _run_causal_recurrent_epoch(
                 target_encoder,
                 chunk_frames=chunk_frames,
                 chunk_tokens=chunk_tokens,
+                feature_source=feature_source,
             )
 
         if training:
@@ -1758,6 +1773,7 @@ def _run_causal_recurrent_epoch(
                     loss_exp=loss_cfg.get("loss_exp", 1.0),
                     motion_beta=loss_cfg.get("motion_beta", 1.0),
                     motion_epsilon=loss_cfg.get("motion_epsilon", 1.0e-6),
+                    objective=objective,
                 )
             losses["loss"].backward()
             trainable = [
@@ -1783,9 +1799,17 @@ def _run_causal_recurrent_epoch(
                     motion_epsilon=loss_cfg.get(
                         "motion_epsilon", 1.0e-6
                     ),
+                    objective=objective,
                 )
             grad_norm = torch.tensor(0.0, device=device)
 
+        if objective == "reconstruct_current":
+            diagnostic = compute_reconstruction_metrics(predictions, prepared_targets)
+            count = clips.shape[0]
+            recon_samples += count
+            for key, value in diagnostic.items():
+                value = torch.as_tensor(value, dtype=torch.float64, device=device)
+                recon_totals[key] = recon_totals.get(key, torch.zeros_like(value)) + value * count
         _sync_for_timing(device)
         batches += 1
         for name in totals:
@@ -1833,6 +1857,18 @@ def _run_causal_recurrent_epoch(
         "batches": batches,
         "elapsed_s": time.perf_counter() - started,
     }
+    if objective == "reconstruct_current":
+        count = torch.tensor(float(recon_samples), dtype=torch.float64, device=device)
+        if world_size > 1:
+            dist.all_reduce(count)
+            for value in recon_totals.values():
+                dist.all_reduce(value)
+        metrics.update({key: (value / count).tolist() for key, value in recon_totals.items()})
+        metrics.update(causal_runtime_metadata(args_eval))
+        metrics["std_aggregation"] = "sample-weighted batch standard deviations"
+        if int(rank) == 0:
+            logger.info("reconstruction_metrics epoch=%d stage=%s %s", epoch, stage,
+                        json.dumps({key: metrics[key] for key in recon_totals}))
     if int(rank) == 0:
         logger.info(
             "epoch=%d stage=%s_done batches=%d loss=%.6f "
@@ -1937,6 +1973,7 @@ def _end_to_end_checkpoint(
     }
     checkpoint.update(_feedback_runtime_metadata(predictor))
     if experiment_mode == "onn_causal_recurrent":
+        checkpoint.update(causal_runtime_metadata(args_eval))
         predictor_cfg = args_eval.get("predictor", {})
         loss_cfg = args_eval.get("loss", {})
         checkpoint.update(
@@ -1945,7 +1982,9 @@ def _end_to_end_checkpoint(
                 "output_mode": "linear",
                 "loss_feature_dim": predictor_model.embed_dim,
                 "output_layer_norm": False,
-                "test_score_mapping": "reciprocal",
+                "test_score_mapping": (
+                    None if predictor_model.objective == "reconstruct_current" else "reciprocal"
+                ),
                 "num_context_chunks": int(
                     predictor_cfg.get("num_context_chunks", 7)
                 ),
@@ -1957,7 +1996,10 @@ def _end_to_end_checkpoint(
                 "motion_epsilon": float(
                     loss_cfg.get("motion_epsilon", 1.0e-6)
                 ),
-                "primary_test_score": "unweighted_prediction_error",
+                "primary_test_score": (
+                    "reconstruction_l1" if predictor_model.objective == "reconstruct_current"
+                    else "unweighted_prediction_error"
+                ),
             }
         )
     return checkpoint
@@ -1994,6 +2036,24 @@ def _load_end_to_end_checkpoint(
             f"{expected_mode} checkpoint has no complete config and cannot be "
             "resumed safely"
         )
+    if expected_mode == "onn_causal_recurrent":
+        model = _unwrap_module(predictor)
+        saved_mode = (checkpoint.get("feature_source", "legacy_dual"),
+                      checkpoint.get("objective", "next_chunk"))
+        requested_mode = (getattr(model, "feature_source", "legacy_dual"),
+                          getattr(model, "objective", "next_chunk"))
+        if saved_mode != requested_mode:
+            raise ValueError(f"checkpoint causal mode {saved_mode} does not match model {requested_mode}")
+        validate_causal_checkpoint(
+            checkpoint, expected_config if expected_config is not None else saved_config
+        )
+    if expected_mode == "onn_causal_recurrent" and expected_config is not None:
+        validate_causal_checkpoint(checkpoint, expected_config)
+        saved_config = copy.deepcopy(saved_config)
+        expected_config = copy.deepcopy(expected_config)
+        for config in (saved_config, expected_config):
+            config.setdefault("predictor", {}).setdefault("feature_source", "legacy_dual")
+            config["predictor"].setdefault("objective", "next_chunk")
     if expected_config is not None and saved_config != expected_config:
         raise ValueError(
             f"{expected_mode} checkpoint config does not match the current config"
@@ -2321,6 +2381,8 @@ def run_end_to_end_jepa(
         raise ValueError(
             f"run_end_to_end_jepa does not support {experiment_mode}"
         )
+    if experiment_mode == "onn_causal_recurrent":
+        validate_causal_config(args_eval)
     if log_path is None:
         log_path = f"{output_path}.log"
     logger = _configure_logging(log_path, rank=rank)
@@ -2433,6 +2495,8 @@ def run_end_to_end_jepa(
             "split_manifest": os.path.abspath(split_manifest),
         }
         runtime_metadata.update(_feedback_runtime_metadata(predictor))
+        if experiment_mode == "onn_causal_recurrent":
+            runtime_metadata.update(causal_runtime_metadata(args_eval))
         _write_training_summary(
             Path(output_path).parent / "training_summary.txt",
             args_eval,
